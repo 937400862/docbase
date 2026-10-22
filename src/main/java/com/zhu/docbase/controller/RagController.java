@@ -1,8 +1,8 @@
-package com.zhu.ragdemo.controller;
+package com.zhu.docbase.controller;
 
-import com.zhu.ragdemo.service.DocumentIngestionService;
-import com.zhu.ragdemo.service.RagChatService;
-import com.zhu.ragdemo.service.RagMaintenanceService;
+import com.zhu.docbase.service.DocumentIngestionService;
+import com.zhu.docbase.service.RagChatService;
+import com.zhu.docbase.service.RagMaintenanceService;
 import org.springframework.web.bind.annotation.*;
 
 /**

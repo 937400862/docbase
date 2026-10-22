@@ -3,7 +3,7 @@
 
     <!-- 日志目录：默认落在工作目录下的 ./logs，可用 -DLOG_HOME=/path 覆盖 -->
     <property name="LOG_HOME" value="${LOG_HOME:-./logs}"/>
-    <property name="APP_NAME" value="ragdemo"/>
+    <property name="APP_NAME" value="docbase"/>
 
     <!-- 控制台输出 -->
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
@@ -30,7 +30,7 @@
     </appender>
 
     <!-- 本项目 DEBUG 级别 -->
-    <logger name="com.zhu.ragdemo" level="DEBUG"/>
+    <logger name="com.zhu.docbase" level="DEBUG"/>
 
     <!-- 第三方库降噪 -->
     <logger name="org.springframework" level="WARN"/>

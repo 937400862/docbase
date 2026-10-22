@@ -1,4 +1,4 @@
-package com.zhu.ragdemo.service;
+package com.zhu.docbase.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;

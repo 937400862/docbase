@@ -1,4 +1,4 @@
-package com.zhu.ragdemo.service;
+package com.zhu.docbase.service;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;

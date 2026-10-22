@@ -1,4 +1,4 @@
-package com.zhu.ragdemo.service;
+package com.zhu.docbase.service;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.vectorstore.QuestionAnswerAdvisor;

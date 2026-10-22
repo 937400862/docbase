@@ -1,6 +1,6 @@
-package com.zhu.ragdemo.job;
+package com.zhu.docbase.job;
 
-import com.zhu.ragdemo.service.RagMaintenanceService;
+import com.zhu.docbase.service.RagMaintenanceService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;

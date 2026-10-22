@@ -1,6 +1,6 @@
-package com.zhu.ragdemo.service;
+package com.zhu.docbase.service;
 
-import com.zhu.ragdemo.RagDemoApplication;
+import com.zhu.docbase.DocbaseApplication;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;

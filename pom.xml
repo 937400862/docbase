@@ -11,9 +11,9 @@
     </parent>
 
     <groupId>com.zhu</groupId>
-    <artifactId>rag-demo</artifactId>
+    <artifactId>docbase</artifactId>
     <version>1.0.0</version>
-    <name>rag-demo</name>
+    <name>docbase</name>
     <description>Local-first RAG knowledge base over Office documents — Spring AI + Ollama + Redis Stack</description>
 
     <properties>
