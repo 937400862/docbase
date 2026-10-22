@@ -21,6 +21,7 @@ derived from measurement rather than guesswork.
 | 单 chunk 真实成本 | **36.9 KB**（含 HNSW 索引） |
 | 单 chunk 嵌入耗时 | **0.18 ~ 0.3 秒** |
 | 每 1 万 chunk | ≈ 360 MB |
+| 单 chunk token 数 | **平均 532 / 最大 604**（jtokkit 实测，切分上限 600 生效） |
 
 > **为什么是 36.9 KB 而不是 26.3 KB**：单条 chunk 的 JSON 键用 `MEMORY USAGE` 量出来是 26,298 字节，
 > 但 `used_memory ÷ 条数` 是 36.9 KB。差的约 10.3 KB/chunk 是 HNSW 索引和分配开销。
@@ -119,6 +120,8 @@ curl 'http://localhost:8800/api/ask?question=报销流程有哪些审批节点'
 | `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis Stack 地址 |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 地址 |
 | `CHAT_MODEL` | `qwen2.5:3b` | 问答模型 |
+| `TEMPERATURE` | `0.1` | 问答温度。别调回 0.7，实测精确问答会从 3/3 掉到 1/3 |
+| `NUM_CTX` | `4096` | 上下文窗口，必须与 `rag.chat.top-k` 匹配 |
 | `EMBEDDING_MODEL` | `bge-m3` | 嵌入模型，换它必须同步改 `dimensions` 并重建索引 |
 | `SANITIZE_MODEL` | `llama3.2:3b` | 语义脱敏模型（该功能默认关闭） |
 | `LOG_HOME` | `./logs` | 日志目录 |
@@ -127,6 +130,8 @@ curl 'http://localhost:8800/api/ask?question=报销流程有哪些审批节点'
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
+| `rag.chat.top-k` | `5` | 检索片段数。受 `num-ctx` 硬约束，且不是越大越好（见文末已知限制） |
+| `rag.chat.similarity-threshold` | `0` | 相似度阈值，0 = 不过滤 |
 | `rag.ingest.embed-batch-size` | `64` | 单批嵌入条数，调大容易触发吞吐塌陷 |
 | `rag.ingest.max-redis-memory-mb` | `1000` | Redis 内存软上限，超限停止本批（已完成的文件重跑时自动跳过） |
 | `rag.ingest.progress-every` | `50` | 每多少个文件打一行进度 |
@@ -273,8 +278,12 @@ metadata 分两级：`source`（文件名）每个 chunk 都存；`path` / `mtim
 
 ## 已知限制
 
-- **泛问能力弱**。"X 是怎么做的"这类开放问题容易答不上，具体问题答得好。原因是 `topK=5` + 3B 模型撑不住开放式归纳——
-  数据是够的（全库有 893 个 chunk 含目标关键词），是检索宽度和模型能力的组合限制。可调方向：调大 topK、加 rerank、换 7B
+- **泛问能力弱**。"X 是怎么做的"这类开放问题容易答不上，具体问题答得好。
+  原因是 `topK=5` + 3B 模型的组合限制——数据是够的（全库有 893 个 chunk 含目标关键词），
+  是检索宽度和模型能力的矛盾。
+  **调大 topK 试过了，不行**：实测 `topK=8` 泛问确实变好，但精确问答从 3/3 答对掉到 0/3——
+  3B 模型在 8 个片段里会丢针。真正的解法是 rerank（宽召回 + 重排回 5），
+  但那要多一个 reranker 模型，3 GB 显存放不下
 - **`.doc` / `.pdf` 表格仍是拍平的**，只有 `.docx` 做了结构还原
 - **幂等是单机单实例**，不是分布式
 - **文件改名会产生孤儿 chunk**，靠体检接口发现，需要手工清理
