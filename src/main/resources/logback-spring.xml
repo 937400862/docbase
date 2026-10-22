@@ -5,10 +5,21 @@
     <property name="LOG_HOME" value="${LOG_HOME:-./logs}"/>
     <property name="APP_NAME" value="docbase"/>
 
+    <!--
+        行格式：时间 线程 级别 类名 - [文件标识] 消息
+
+        为什么 [%X{f}] 只放短序号（#001）而不是完整路径：
+        摄入时每个文件会产生 2~4 行日志，把 60~100 字符的路径放进 MDC 会让每行都重复一遍，
+        而消息体里往往还写了一次 —— 同一行出现两遍，整行 200 字符，真正的内容反而看不清。
+        现在完整路径只在"开始"行打印一次，用 grep '#007' 就能把该文件的全部日志串起来。
+    -->
+    <property name="LOG_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{20} - [%X{f}] %msg%n"/>
+
     <!-- 控制台输出 -->
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - [%X{file}] %msg%n</pattern>
+            <pattern>${LOG_PATTERN}</pattern>
             <charset>UTF-8</charset>
         </encoder>
     </appender>
@@ -17,11 +28,11 @@
     <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
         <file>${LOG_HOME}/${APP_NAME}.log</file>
         <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - [%X{file}] %msg%n</pattern>
+            <pattern>${LOG_PATTERN}</pattern>
             <charset>UTF-8</charset>
         </encoder>
         <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
-            <!-- 每天+每个 50MB 生成一个文件 -->
+            <!-- 每天 + 每个 30MB 生成一个文件 -->
             <fileNamePattern>${LOG_HOME}/${APP_NAME}-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
             <maxFileSize>30MB</maxFileSize>
             <maxHistory>30</maxHistory>
@@ -29,8 +40,13 @@
         </rollingPolicy>
     </appender>
 
-    <!-- 本项目 DEBUG 级别 -->
-    <logger name="com.zhu.docbase" level="DEBUG"/>
+    <!--
+        本项目默认 INFO。
+        排查问题时临时开 DEBUG，不用改文件：在启动参数里把
+        logging.level.com.zhu.docbase 设成 DEBUG 即可。
+        常开 DEBUG 会让每个"已摄入过而跳过"的文件多打一行，几万个文件时日志会膨胀。
+    -->
+    <logger name="com.zhu.docbase" level="INFO"/>
 
     <!-- 第三方库降噪 -->
     <logger name="org.springframework" level="WARN"/>
@@ -38,6 +54,14 @@
     <logger name="redis" level="WARN"/>
     <logger name="io.lettuce" level="WARN"/>
     <logger name="org.springframework.ai" level="INFO"/>
+
+    <!--
+        Spring AI 的切分器会对每个文件打一行 "Splitting up document into N chunks"，
+        而我们自己的"完成: N 个片段"已经包含同样信息 —— 纯重复，直接压到 WARN。
+        （这条要放在 org.springframework.ai 之后，logback 按最长前缀匹配，顺序其实无所谓，
+          写在这里只是为了让人一眼看到它是从父 logger 里单独摘出来的）
+    -->
+    <logger name="org.springframework.ai.transformer.splitter" level="WARN"/>
 
     <root level="INFO">
         <appender-ref ref="CONSOLE"/>

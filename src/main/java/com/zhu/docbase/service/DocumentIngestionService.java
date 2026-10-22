@@ -66,6 +66,17 @@ public class DocumentIngestionService {
     private final SanitizeService sanitizeService;
 
     /**
+     * 本次运行内的文件序号，用于日志里的短标识（#001、#002…）。
+     *
+     * <p>为什么不把完整路径放进 MDC：那样每行都要重复一遍 60~100 字符的路径，
+     * 而消息体里往往还写了一次 —— 同一行出现两遍，日志被撑成 200 字符。
+     * 改成序号后，完整路径只在"开始"行打印一次，
+     * 用 {@code grep '#007'} 就能把该文件的全部日志串起来。
+     */
+    private final java.util.concurrent.atomic.AtomicInteger fileSeq =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
      * 【改动】新增：正文抽取器（docx 表格还原 / 文本编码兜底 / Tika 大栈）。
      * 原来这些逻辑都堆在本类里，现在拆出去，本类只负责"切分 + 脱敏 + 入库"。
      */
@@ -493,11 +504,15 @@ public class DocumentIngestionService {
      * @return 摄入结果
      */
     public IngestResult ingestFile(String filePath, boolean overwrite) {
-        // 把文件路径放入 MDC，所有后续日志都会带上它
-        MDC.put("file", filePath);
+        // MDC 只放短序号，不放完整路径 —— 完整路径在下面"开始"行打一次即可。
+        // 先存旧值：目录摄入时外层标签是 DIR，处理完必须恢复回去，不能直接清空。
+        String prevTag = MDC.get("f");
+        String tag = String.format("#%03d", fileSeq.incrementAndGet());
+        MDC.put("f", tag);
         try {
             File file = new File(filePath);
             String fileName = file.getName();
+            log.info("开始: {}", filePath);
             int[] params = getSplitParams(fileName);
             int chunkSize = params[0];
             int minChunkSizeChars = params[1];
@@ -518,7 +533,7 @@ public class DocumentIngestionService {
                 if (!overwrite && stamp.mtime() == file.lastModified()) {
                     // 完整性校验：只查最后一个 chunk 在不在，不用先切分就知道文不完整
                     if (chunkExists(hash, stamp.chunkCount() - 1)) {
-                        log.debug("跳过（已摄入且未改动）: {}", filePath);
+                        log.debug("跳过: 已摄入且未改动");
                         return IngestResult.skipDone();
                     }
                     log.warn("发现残缺文件（声明 {} 个 chunk，最后一个不存在），删除后重新摄入: {}",
@@ -527,7 +542,7 @@ public class DocumentIngestionService {
                     log.info("文件已改动（mtime {} → {}），删除旧 chunk 重新摄入: {}",
                             stamp.mtime(), file.lastModified(), filePath);
                 } else {
-                    log.info("强制覆盖摄入: {}", filePath);
+                    log.info("强制覆盖摄入（忽略 mtime，直接删了重摄）");
                 }
                 needReplace = true;
             }
@@ -553,8 +568,8 @@ public class DocumentIngestionService {
             //    实测 bcmap/rpm/~$ 锁文件等 1704 个文件只能抽出 0~1 个字符，
             //    以前会走完切分得到 0 片段并被记成"摄入失败"。
             if (rawText == null || rawText.strip().length() < MIN_TEXT_CHARS) {
-                log.warn("跳过（解析出内容过短，{} 字符）: {}",
-                        rawText == null ? 0 : rawText.strip().length(), filePath);
+                log.warn("跳过: 解析出内容过短（{} 字符）",
+                        rawText == null ? 0 : rawText.strip().length());
                 return IngestResult.skipShort();
             }
 
@@ -635,7 +650,7 @@ public class DocumentIngestionService {
             // 9.2 【改动 2026-10-22】切分结果为空（理论上不会，前面已挡过 <20 字符）：
             //     直接返回，别把旧数据删了又什么都不写。
             if (finalDocuments.isEmpty()) {
-                log.warn("切分后没有任何片段，保留库里原有数据: {}", filePath);
+                log.warn("切分后没有任何片段，保留库里原有数据");
                 return IngestResult.skipShort();
             }
 
@@ -666,7 +681,7 @@ public class DocumentIngestionService {
                     int to = Math.min(from + batchSize, totalChunks);
                     vectorStore.add(finalDocuments.subList(from, to));
                     if (totalChunks > batchSize) {
-                        log.info("嵌入进度 [{}/{}]（文件: {}）", to, totalChunks, fileName);
+                        log.info("嵌入进度 [{}/{}]", to, totalChunks);
                     }
                 }
             } catch (Throwable t) {
@@ -675,8 +690,8 @@ public class DocumentIngestionService {
                 throw t;
             }
 
-            log.info("已摄入{}: {}, 切分为 {} 个片段（hash={}）",
-                    useAi ? "（正则+AI脱敏）" : "（仅正则脱敏）", filePath, totalChunks, hash);
+            log.info("完成: {} 个片段（hash={}）{}",
+                    totalChunks, hash, useAi ? " 正则+AI脱敏" : " 仅正则脱敏");
             return IngestResult.ok(totalChunks);
         } catch (Throwable t) {
             // 必须是 Throwable 而不是 Exception：
@@ -684,12 +699,18 @@ public class DocumentIngestionService {
             // 会一路冒到 Spring MVC 变成 500，把整个批量任务打断。
             // 这里兜住 → 单个文件失败只算一次失败，后面的文件继续跑。
             // （副作用：OutOfMemoryError 也会被吞掉，若真遇到 OOM 需看日志确认）
-            log.error("摄入失败: {}", t.toString(), t);
+            // 失败行带上文件名：错误很少见，长一点不影响可读性，
+            // 但 grep "失败" 时能直接看出是哪个文件，不用再按序号反查。
+            log.error("失败: {} | {}", new File(filePath).getName(), t.toString(), t);
             // 【改动】失败返回 failed()，和"内容过短跳过"区分开
             return IngestResult.failed();
         } finally {
-            // 清理 MDC，避免污染后续日志
-            MDC.remove("file");
+            // 恢复而不是清空：目录摄入时外层是 DIR，直接 remove 会让后续目录级日志变成 []
+            if (prevTag == null) {
+                MDC.remove("f");
+            } else {
+                MDC.put("f", prevTag);
+            }
         }
     }
 
@@ -710,7 +731,8 @@ public class DocumentIngestionService {
         // 【改动 2026-10-20 晚】新增：之前已摄入过（断点续传命中）的文件数
         int doneCount = 0;
 
-        MDC.put("file", "DIR:" + dirPath);
+        // 目录级日志用固定标签 DIR；路径由下面那行 === 开始递归摄入目录 === 打一次，不重复
+        MDC.put("f", "DIR");
 
         try (Stream<Path> paths = Files.walk(rootPath)) {
             List<Path> fileList = paths
@@ -735,9 +757,10 @@ public class DocumentIngestionService {
                 // 【改动 2026-10-20 晚】进度日志改成节流：每 progressEvery 个文件打一行。
                 // 原来每个文件一行 INFO，6 万多个文件会写几百 MB 日志。
                 // 最后一个文件仍然打，方便确认"跑到了哪"。
+                // 【2026-10-22】不再打印当前文件名：紧跟其后的 [#NNN] 开始: 行已经带了完整路径，
+                // 这里只保留"进度 + 剩余"，避免同一信息出现两遍。
                 if (processed % Math.max(progressEvery, 1) == 0 || processed == total) {
-                    log.info("=== 进度 [{}/{}] | 剩余 {} 个文件 | 当前: {} ===",
-                            processed, total, remaining, fileName);
+                    log.info("=== 进度 [{}/{}] | 剩余 {} 个文件 ===", processed, total, remaining);
                 }
 
                 // 【改动 2026-10-20 晚】内存软上限：每 progressEvery 个文件查一次 Redis 已用内存。
@@ -784,7 +807,9 @@ public class DocumentIngestionService {
                     // 否则 StackOverflowError 会穿透目录循环，终止整批任务。
                     failCount++;
                     // 继续处理下一个文件，不中断整个流程
-                    log.error("摄入失败: {} | 原因: {}", path, t.toString());
+                    // 这里补一句带路径的错误：ingestFile 内部已经兜住 Throwable 并记过日志，
+                    // 走到这里说明异常发生在 ingestFile 之外（内存检查等），路径需要单独给出。
+                    log.error("目录循环异常: {} | {}", path, t.toString());
                 }
             }
             long duration = System.currentTimeMillis() - startTime;
