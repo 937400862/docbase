@@ -438,6 +438,22 @@ public class DocumentIngestionService {
     private List<Document> assignIds(List<Document> chunks, String hash, File file) {
         int total = chunks.size();
         List<Document> out = new ArrayList<>(total);
+        // 【2026-10-22 新增】给每个 chunk 的正文加一行来源前缀，让文件名进入向量索引。
+        //
+        // 起因（实测）：有些文件的关键信息只写在文件名里 —— 比如版本号、日期 ——
+        // 正文几十个 chunk 里一次都没提到（grep 命中 0 次），纯正文向量检索永远召不回。
+        // 纯正文向量检索永远召不回它 —— 这不是检索算法的问题，是索引里根本没这个信息。
+        // 加前缀后，文件名同时进入两个地方：向量（text 被 embedding）和 prompt（模型能看到来源）。
+        //
+        // ⚠️ 必须加在切分之后：
+        //   加在切分前，这 30 个 token 会占掉 600 token 的预算，chunk 会变多、边界会变。
+        //   加在这里，chunk 数量和边界完全不变，diff 干净。
+        //
+        // 内存成本几乎为零：每个 chunk 在 Redis 里占 26.3 KB，其中正文只占约 0.9 KB，
+        // 剩下是 1024 维向量的 JSON 文本。内存由 chunk 数量决定，不由正文长度决定，
+        // 加 30 字符只让单键从 26,298 变成约 26,328 字节（+0.1%）。
+        // 真正的成本在 prompt：每个检索片段多约 30 token，topK=5 多 150 token。
+        String prefix = "【来源：" + file.getName() + "】\n";
         for (int i = 0; i < total; i++) {
             Document d = chunks.get(i);
             Map<String, Object> meta = new HashMap<>();
@@ -447,7 +463,7 @@ public class DocumentIngestionService {
                 meta.put("mtime", file.lastModified());
                 meta.put("chunk_count", total);
             }
-            out.add(new Document(hash + "#" + i, d.getText(), meta));
+            out.add(new Document(hash + "#" + i, prefix + d.getText(), meta));
         }
         return out;
     }
@@ -720,6 +736,19 @@ public class DocumentIngestionService {
      * 如果你的工作资料是嵌套目录结构，可以改用 Files.walk() 递归遍历。
      */
     public int ingestDirectory(String dirPath) {
+        return ingestDirectory(dirPath, false);
+    }
+
+    /**
+     * 【2026-10-22 新增】带 overwrite 的目录摄入。
+     *
+     * <p>为什么需要：改了入库逻辑（比如给 chunk 加来源前缀）之后，文件的 mtime 没变，
+     * 默认的 skip 模式会把所有文件判成"已摄入且未改动"全部跳过 —— 看起来跑了，其实什么都没变。
+     * 这时必须整目录 overwrite 重摄。
+     *
+     * @param overwrite true = 无视 mtime，逐文件删掉重摄
+     */
+    public int ingestDirectory(String dirPath, boolean overwrite) {
         Path rootPath = Paths.get(dirPath);
         int totalChunks = 0;
         int fileCount = 0;
@@ -786,7 +815,7 @@ public class DocumentIngestionService {
                     // "N 个走 正则+AI 脱敏"（实际一个都没走），日志会误导人。
                     boolean useAi = aiSanitizeEnabled && shouldUseAiSanitize(path.getFileName().toString());
                     // 【改动】ingestFile 现在返回 IngestResult（片段数 + 状态）
-                    IngestResult result = ingestFile(path.toAbsolutePath().toString());
+                    IngestResult result = ingestFile(path.toAbsolutePath().toString(), overwrite);
                     switch (result.status()) {
                         // 【改动 2026-10-20 晚】"已摄入过"单独计数，不算跳过也不算失败
                         case SKIPPED_DONE -> doneCount++;

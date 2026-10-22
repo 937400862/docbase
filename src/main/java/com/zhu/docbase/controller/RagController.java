@@ -86,10 +86,18 @@ public class RagController {
         };
     }
 
-    /** 摄入整个目录 */
+    /**
+     * 摄入整个目录。
+     *
+     * @param mode 【2026-10-22 新增】skip（默认）= 已摄入且未改动就跳过；
+     *             overwrite = 无视 mtime，逐文件删掉重摄。
+     *             改了入库逻辑（切分规则、metadata、来源前缀）之后必须用 overwrite，
+     *             否则 mtime 没变，所有文件都会被判成"已摄入且未改动"跳过。
+     */
     @PostMapping("/ingest/dir")
-    public String ingestDir(@RequestParam String path) {
-        int chunks = ingestionService.ingestDirectory(path);
+    public String ingestDir(@RequestParam String path,
+                            @RequestParam(defaultValue = "skip") String mode) {
+        int chunks = ingestionService.ingestDirectory(path, "overwrite".equalsIgnoreCase(mode));
         return "目录摄入完成，共 " + chunks + " 个片段";
     }
 
