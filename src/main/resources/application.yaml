@@ -5,6 +5,12 @@ spring:
   application:
     name: docbase
 
+  # 默认激活 local profile。
+  # 本地开发的实际连接信息放在 application-local.yaml（该文件不入库，见 .gitignore），
+  # 所以刚 clone 下来、没有这个文件时，会安静地回退到本文件里的 ${ENV:default} 默认值（指向 localhost）。
+  profiles:
+    default: local
+
   # 启动时校验 JVM 的文件编码，不是"设置"。
   # file.encoding 是 JVM 系统属性，Spring 启动时 JVM 早已初始化完，yaml 改不了它。
   # JDK 18+ 默认 UTF-8（JEP 400），本项目跑 JDK 21 实测已是 UTF-8；
@@ -24,9 +30,10 @@ spring:
     ollama:
       base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
       chat:
-        # 问答模型。中文场景选 qwen 系列；显存小的时候用 lowvram 变体。
-        # 换模型不需要改代码，起服务时用 --spring.ai.ollama.chat.model=xxx 覆盖即可。
-        model: ${CHAT_MODEL:qwen2.5-3b-lowvram}
+        # 问答模型。这里给的是 Ollama 官方仓库里能直接 pull 的标签，
+        # 保证 clone 下来就能跑；显存小的话在 application-local.yaml 里覆盖成 lowvram 变体。
+        # 换模型不需要改代码：--spring.ai.ollama.chat.model=xxx
+        model: "${CHAT_MODEL:qwen2.5:3b}"
         temperature: 0.7
       embedding:
         # bge-m3：中文强，1024 维，8192 上下文。
@@ -56,9 +63,10 @@ rag:
     #
     # 需要时用 --rag.sanitize.ai-enabled=true 临时打开，建议只对少量叙述性文档开。
     ai-enabled: false
-    # 语义脱敏专用模型。不填则复用上面的 chat 模型。
+    # 语义脱敏专用模型。默认关闭该功能，所以这里给官方标签即可；
+    # 真要开的时候建议在 application-local.yaml 里换成自己调过的模型。
     # 注意 qwen 系列处理中文姓名会只换姓不换名（"王建国"→"[PERSON]建国"），属于假脱敏。
-    model: ${SANITIZE_MODEL:llama3.2-3b-sanitize}
+    model: "${SANITIZE_MODEL:llama3.2:3b}"
 
   # 摄入行为
   ingest:

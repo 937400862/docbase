@@ -360,13 +360,13 @@ public class DocumentTextExtractor {
     // ==================== 文本清理 ====================
 
     /**
-     * 目录条目：编号 + 标题 + 制表符 + 页码，例如 {@code 1.1. 接入方、接口权限控制\t3}。
+     * 目录条目：编号 + 标题 + 制表符 + 页码，例如 {@code 1.1. 第三方接入与权限控制\t3}。
      */
     private static final Pattern TOC_TAB_ENTRY =
             Pattern.compile("^\\s*\\d+(\\.\\d+)*\\.?\\s*\\S.*\\t\\s*\\d{1,4}\\s*$");
 
     /**
-     * 目录条目（PDF 版）：编号 + 标题 + 点线 + 页码，例如 {@code 1. 示例系统 ........ 3}。
+     * 目录条目（PDF 版）：编号 + 标题 + 点线 + 页码，例如 {@code 1. 订单服务 ........ 3}。
      */
     private static final Pattern TOC_DOT_ENTRY =
             Pattern.compile("^\\s*\\d+(\\.\\d+)*\\.?\\s*\\S.*\\.{3,}\\s*\\d{1,4}\\s*$");
