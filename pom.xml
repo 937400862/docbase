@@ -16,6 +16,14 @@
     <name>docbase</name>
     <description>Local-first RAG knowledge base over Office documents — Spring AI + Ollama + Redis Stack</description>
 
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
     <properties>
         <java.version>21</java.version>
         <spring-ai.version>2.0.0</spring-ai.version>
