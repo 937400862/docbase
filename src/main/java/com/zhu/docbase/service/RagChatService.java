@@ -2,10 +2,15 @@ package com.zhu.docbase.service;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.vectorstore.QuestionAnswerAdvisor;
+import org.springframework.ai.chat.prompt.PromptTemplate;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 
 /**
  * RAG 问答服务：封装两种对话模式。
@@ -35,11 +40,19 @@ public class RagChatService {
      * 字段注入发生在构造器执行之后，构造器里读到的还是 0 ——
      * 那样会得到 {@code topK(0)}，运行时报
      * "The number of documents to be returned must be greater than zero"。
+     *
+     * @param promptFile 问答提示词模板的 classpath 位置。
+     *                   默认模板在 {@code QuestionAnswerAdvisor} 里，最后一句是
+     *                   "If the answer is not in the context, inform the user that you can't answer the question"，
+     *                   3B 会严格照做：只要没有一个片段完整覆盖问题就整句拒答。
+     *                   实测泛问题目 gold 就在 top-5 里，模型仍然回答"上下文中没有提供相关信息"。
+     *                   所以改成外置模板（见 resources/prompts/qa.txt）。
      */
     public RagChatService(ChatClient.Builder builder,
                           VectorStore vectorStore,
                           @Value("${rag.chat.top-k:5}") int topK,
-                          @Value("${rag.chat.similarity-threshold:0}") double similarityThreshold) {
+                          @Value("${rag.chat.similarity-threshold:0}") double similarityThreshold,
+                          @Value("${rag.chat.prompt-file:prompts/qa.txt}") String promptFile) {
         // 构建一个"干净"的 ChatClient，不绑定任何默认 Advisor
         // 这样 ask() 和 chat() 才能通过动态添加 Advisor 来区分行为。
         this.chatClient = builder.build();
@@ -56,7 +69,17 @@ public class RagChatService {
         }
         this.ragAdvisor = QuestionAnswerAdvisor.builder(vectorStore)
                 .searchRequest(search.build())
+                .promptTemplate(new PromptTemplate(readPrompt(promptFile)))
                 .build();
+    }
+
+    /** 从 classpath 读提示词模板。读不到直接启动失败，不要静默退回默认模板 —— 那样改了半天等于没改。 */
+    private static String readPrompt(String location) {
+        try {
+            return new ClassPathResource(location).getContentAsString(StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new IllegalStateException("读取提示词模板失败: " + location, e);
+        }
     }
 
     /**

@@ -85,6 +85,12 @@ rag:
     #
     # 另外：topK 受 num-ctx 硬约束，装不下的片段会被静默截断，等于白检索。
     top-k: ${TOP_K:5}
+    # 问答提示词模板（classpath 位置）。
+    # 不用 Spring AI 的默认模板，因为它的最后一句是
+    #   "If the answer is not in the context, inform the user that you can't answer the question"
+    # 3B 会严格照做：只要没有一个片段完整覆盖问题就整句拒答。
+    # 实测泛问题目的 gold 就在 top-5 里，模型仍然回答"上下文中没有提供相关信息"。
+    prompt-file: ${QA_PROMPT_FILE:prompts/qa.txt}
     # 相似度阈值（0~1），0 = 不过滤。
     # 默认关：不同 embedding 的分数分布不同，bge-m3 + COSINE 集中在 0.5~0.8，
     # 套一个通用阈值容易把相关内容一起滤掉。要开先量分布再定。

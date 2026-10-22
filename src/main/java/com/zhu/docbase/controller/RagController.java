@@ -3,7 +3,12 @@ package com.zhu.docbase.controller;
 import com.zhu.docbase.service.DocumentIngestionService;
 import com.zhu.docbase.service.RagChatService;
 import com.zhu.docbase.service.RagMaintenanceService;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.vectorstore.SearchRequest;
+import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
 
 /**
  *
@@ -18,13 +23,45 @@ public class RagController {
     private final RagChatService ragChatService;
     /** 【改动 2026-10-22】体检服务，给 /maintenance/* 用 */
     private final RagMaintenanceService maintenanceService;
+    /** 【改动 2026-10-22】给 /retrieve 用：直接看检索结果，不经过 LLM */
+    private final VectorStore vectorStore;
 
     public RagController(DocumentIngestionService ingestionService,
                          RagChatService ragChatService,
-                         RagMaintenanceService maintenanceService) {
+                         RagMaintenanceService maintenanceService,
+                         VectorStore vectorStore) {
         this.ingestionService = ingestionService;
         this.ragChatService = ragChatService;
         this.maintenanceService = maintenanceService;
+        this.vectorStore = vectorStore;
+    }
+
+    /**
+     * 【2026-10-22 新增】检索诊断：只做向量检索，不调用 LLM，把候选片段原样返回。
+     *
+     * <p>为什么需要：/ask 只给最终答案，看不出"答不上"是因为没检索到，还是检索到了但模型没组织好。
+     * 评测集要判断一道题的 gold 到底在不在 top-20 候选里，只能靠这个接口。
+     *
+     * @param question 问题
+     * @param topK     返回多少个候选，默认 20（比问答时的 5 宽，用于观察召回上限）
+     */
+    @GetMapping("/retrieve")
+    public String retrieve(@RequestParam String question,
+                           @RequestParam(defaultValue = "20") int topK) {
+        List<Document> docs = vectorStore.similaritySearch(
+                SearchRequest.builder().query(question).topK(topK).build());
+        StringBuilder sb = new StringBuilder();
+        sb.append("命中 ").append(docs.size()).append(" 个候选\n\n");
+        for (int i = 0; i < docs.size(); i++) {
+            Document d = docs.get(i);
+            sb.append("### RANK ").append(i + 1)
+                    .append(" | id=").append(d.getId())
+                    .append(" | source=").append(d.getMetadata().get("source"))
+                    .append('\n')
+                    .append(d.getText())
+                    .append("\n\n");
+        }
+        return sb.toString();
     }
 
     /**
