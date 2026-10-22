@@ -1,0 +1,67 @@
+# ---------------------------------------------------------------------------
+# 本仓库只跟踪「源码 + clone 后能跑起来的必要文件」。
+# 运行时产物、日志、本机配置、IDE 文件一律忽略。
+# ---------------------------------------------------------------------------
+
+# ---- 运行日志（含摄入文件的绝对路径，绝不入库） ----
+logs/
+*.log
+*.log.*
+*.out
+
+# ---- 构建产物 ----
+target/
+build/
+out/
+dist/
+dependency-reduced-pom.xml
+.flattened-pom.xml
+
+# ---- 本机构建缓存 ----
+# mvn dependency:build-classpath 的产物，含本机 Maven 仓库绝对路径
+cp.txt
+
+# ---- 本地配置覆盖（放连接串、密钥，不入库） ----
+.env
+.env.*
+application-local.yaml
+application-local.yml
+application-local.properties
+application-*.local.*
+
+# ---- IDE ----
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.classpath
+.project
+.factorypath
+.springBeans
+.sts4-cache
+.apt_generated
+/nbproject/private/
+/nbbuild/
+/nbdist/
+/.nb-gradle/
+
+# ---- Spring Initializr 生成的占位文档（内容对使用者无意义） ----
+HELP.md
+
+# ---- Maven wrapper 二进制（mvnw 首次运行会自动下载） ----
+.mvn/wrapper/maven-wrapper.jar
+
+# ---- 操作系统 ----
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---- 崩溃与临时文件 ----
+hs_err_pid*
+*.hprof
+*.pid
+*.bak
+*.tmp
+*.swp

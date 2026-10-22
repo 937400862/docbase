@@ -1,0 +1,95 @@
+server:
+  port: ${SERVER_PORT:8800}
+
+spring:
+  application:
+    name: RAGDemo
+
+  # 启动时校验 JVM 的文件编码，不是"设置"。
+  # file.encoding 是 JVM 系统属性，Spring 启动时 JVM 早已初始化完，yaml 改不了它。
+  # JDK 18+ 默认 UTF-8（JEP 400），本项目跑 JDK 21 实测已是 UTF-8；
+  # 这行的作用是启动时断言：编码不对就直接失败，而不是摄入跑了一半才发现中文乱码。
+  mandatory-file-encoding: UTF-8
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+  ai:
+    # 嵌入模型走 Ollama（本地、离线）。改用别的 provider 时改这里。
+    model:
+      embedding: ollama
+
+    ollama:
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
+      chat:
+        # 问答模型。中文场景选 qwen 系列；显存小的时候用 lowvram 变体。
+        # 换模型不需要改代码，起服务时用 --spring.ai.ollama.chat.model=xxx 覆盖即可。
+        model: ${CHAT_MODEL:qwen2.5-3b-lowvram}
+        temperature: 0.7
+      embedding:
+        # bge-m3：中文强，1024 维，8192 上下文。
+        # 换 embedding 模型必须同步改下面的 dimensions 并重建索引，否则维度不匹配。
+        model: ${EMBEDDING_MODEL:bge-m3}
+
+    vectorstore:
+      redis:
+        host: ${REDIS_HOST:localhost}
+        port: ${REDIS_PORT:6379}
+        index-name: work-docs-index
+        # Redis Key 前缀，实际键名形如 doc:<sha256前32位>#<chunk序号>
+        prefix: "doc:"
+        # 必须与 embedding 模型输出维度一致（bge-m3 = 1024，all-MiniLM-L6-v2 = 384）
+        dimensions: 1024
+        # 启动时自动创建索引（幂等，已存在则跳过）
+        initialize-schema: true
+
+rag:
+  sanitize:
+    # 是否在正则脱敏之后再走一遍小模型做语义脱敏。
+    #
+    # 默认关闭。实测单 chunk 需要 17~34 秒（生成速度 32.5 tok/s 是 3GB 显存的硬件上限，
+    # 并发无收益），6.5 万个文档 chunk 要 13~26 天；且人名召回率只有 20%
+    # （5 个名字只换掉 1 个），还会把字段名"人民币金额"误替换成 [PERSON]。
+    # 结论：正则脱敏已足够覆盖 IP / 账号 / 密钥这类结构化信息，语义脱敏不划算。
+    #
+    # 需要时用 --rag.sanitize.ai-enabled=true 临时打开，建议只对少量叙述性文档开。
+    ai-enabled: false
+    # 语义脱敏专用模型。不填则复用上面的 chat 模型。
+    # 注意 qwen 系列处理中文姓名会只换姓不换名（"王建国"→"[PERSON]建国"），属于假脱敏。
+    model: ${SANITIZE_MODEL:llama3.2-3b-sanitize}
+
+  # 摄入行为
+  ingest:
+    # Redis 内存软上限（MB），0 = 不限制。
+    # 每处理若干个文件查一次 used_memory，超限就停止本批并打日志；
+    # 已完成的文件重跑时会自动跳过，所以停下来是安全的。
+    # 实测单 chunk 真实成本约 36.9 KB（含 HNSW 索引），按目标机器可用内存倒推这个值。
+    max-redis-memory-mb: 1000
+
+    # 目录摄入时每处理多少个文件打一行进度。
+    # 每个文件一行在几万文件的规模下会写出几百 MB 日志。
+    progress-every: 50
+
+    # 单次提交给 embedding 模型的 chunk 数。
+    # 一次性提交整批会让吞吐塌陷：实测 686 个 chunk 一次发送后 17 分钟没有返回，
+    # 而分批后稳定在 0.18~0.3 秒/chunk，且每批都有进度可观测。
+    embed-batch-size: 64
+
+    # 单文件最多保留多少个 chunk，超出截断。0 = 不限制（默认）。
+    # 截断会让文件不完整（686 个只留 300 就丢了 56%），所以默认关闭；
+    # 留这个开关是为了应对真正的病态文件。
+    max-chunks-per-file: 0
+
+  # 知识库体检 / 修复定时任务
+  # 默认关闭：体检要扫全库的键，修复要重新解析 + 嵌入，跑之前先确认没有别的摄入任务。
+  maintenance:
+    enabled: false
+    # 体检（孤儿 / 残缺 / 重复，只读不修改）
+    report-cron: "0 30 3 * * ?"
+    # 修复残缺（删掉重摄），单次最多修 fix-limit 个
+    fix-cron: "0 30 4 * * ?"
+    fix-limit: 50
+    # 体检时是否顺带查重复文件（要读文件内容，比较慢）
+    check-duplicates: true
