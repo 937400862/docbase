@@ -34,7 +34,26 @@ spring:
         # 保证 clone 下来就能跑；显存小的话在 application-local.yaml 里覆盖成 lowvram 变体。
         # 换模型不需要改代码：--spring.ai.ollama.chat.model=xxx
         model: "${CHAT_MODEL:qwen2.5:3b}"
-        temperature: 0.7
+        options:
+          # 温度 0.1，不是 0.7。
+          #
+          # RAG 问答是"从给定材料里抽事实"，不是创作，随机性是负担不是优点。
+          # 实测（同一问题问 3 次，模型 qwen2.5-3b-lowvram，topK=5）：
+          #   temperature 0.7 → 1/3 次答对（另两次说"没找到"，或把答案说成同义反复）
+          #   temperature 0.1 → 3/3 次答对，且都能说出答案里的关键机制名
+          # 温度高时 3B 模型会在"保守说不知道"和"自由发挥"之间随机跳。
+          #
+          # 不要再调回 0.7：Modelfile 里那行 temperature 只是模型默认值，这里会覆盖它。
+          temperature: ${TEMPERATURE:0.1}
+
+          # 上下文窗口。这个值必须和 rag.chat.top-k 一起看：
+          #   全库 chunk 实测平均 532 token、最大 604（CL100K 真实分词，不是按字符估算），
+          #   topK × 平均 ≈ 片段占用，再加问题/指令/回答约 700。
+          #   topK=5 → 约 3,360，4096 刚好够；
+          #   topK=8 → 约 4,960，必须提到 6144，否则超出部分被 Ollama 静默截断。
+          # 显存代价（qwen2.5 有 2 个 KV head，约 36 KB/token）：
+          #   4096 ≈ 144 MB，6144 ≈ 216 MB，8192 ≈ 288 MB。
+          num-ctx: ${NUM_CTX:4096}
       embedding:
         # bge-m3：中文强，1024 维，8192 上下文。
         # 换 embedding 模型必须同步改下面的 dimensions 并重建索引，否则维度不匹配。
@@ -53,6 +72,24 @@ spring:
         initialize-schema: true
 
 rag:
+  # 问答检索参数
+  chat:
+    # 检索返回的片段数。默认 5 —— 这是实测选出来的，不是保守。
+    #
+    # 同一批问题对比 topK=5 与 topK=8（temperature 0.1，各跑 3 次）：
+    #   精确问题（"X 是什么时候做的"）: topK=5 → 3/3 答对；topK=8 → 0/3 答对
+    #   泛问（"X 是怎么做的"）        : topK=5 → 答不上；  topK=8 → 答得很好
+    # 也就是说 topK 拉大确实能救泛问，但 3B 模型在 8 个片段里会丢针，精确问答直接崩。
+    # 这个取舍没法用参数两全 —— 真正的解法是 rerank（宽召回 + 重排到 5），
+    # 但那要多一个 reranker 模型，3 GB 显存放不下。
+    #
+    # 另外：topK 受 num-ctx 硬约束，装不下的片段会被静默截断，等于白检索。
+    top-k: ${TOP_K:5}
+    # 相似度阈值（0~1），0 = 不过滤。
+    # 默认关：不同 embedding 的分数分布不同，bge-m3 + COSINE 集中在 0.5~0.8，
+    # 套一个通用阈值容易把相关内容一起滤掉。要开先量分布再定。
+    similarity-threshold: ${SIMILARITY_THRESHOLD:0}
+
   sanitize:
     # 是否在正则脱敏之后再走一遍小模型做语义脱敏。
     #

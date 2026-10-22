@@ -4,6 +4,7 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.vectorstore.QuestionAnswerAdvisor;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 /**
@@ -19,32 +20,42 @@ public class RagChatService {
     private final ChatClient chatClient;
     private final QuestionAnswerAdvisor ragAdvisor;
 
-    public RagChatService(ChatClient.Builder builder, VectorStore vectorStore) {
+    /**
+     * @param topK 检索片段数。
+     *             默认 5，不是随便定的：全库 4,497 个 chunk 实测平均 532 token、最大 604
+     *             （CL100K 真实分词，不是按字符数估算），topK=5 典型占 2,658 token，
+     *             加上问题/指令/回答预留后正好吃满 4096 上下文。
+     *             再往上加必须同步提高 num_ctx（见 application.yaml 的 num-ctx 注释），
+     *             否则超出部分被 Ollama 静默截断，检索得再多也装不进去，回答反而更差。
+     * @param similarityThreshold 相似度阈值，0 = 不过滤。
+     *             默认关闭：不同 embedding 的分数分布不同，bge-m3 + COSINE 集中在 0.5~0.8，
+     *             硬套一个通用阈值容易把相关内容一起滤掉。要开先量分布。
+     *
+     * <p>注意：这两个值必须用构造器参数注入，不能用 {@code @Value} 字段。
+     * 字段注入发生在构造器执行之后，构造器里读到的还是 0 ——
+     * 那样会得到 {@code topK(0)}，运行时报
+     * "The number of documents to be returned must be greater than zero"。
+     */
+    public RagChatService(ChatClient.Builder builder,
+                          VectorStore vectorStore,
+                          @Value("${rag.chat.top-k:5}") int topK,
+                          @Value("${rag.chat.similarity-threshold:0}") double similarityThreshold) {
         // 构建一个"干净"的 ChatClient，不绑定任何默认 Advisor
         // 这样 ask() 和 chat() 才能通过动态添加 Advisor 来区分行为。
         this.chatClient = builder.build();
+
         // ========== 构建 RAG Advisor ==========
         // QuestionAnswerAdvisor 是一个拦截器，它会在请求到达 LLM 之前：
         //   1. 拦截用户问题
         //   2. 调用 vectorStore.similaritySearch() 检索最相关的文档片段
         //   3. 把检索结果拼接到 Prompt 中，形成"基于以下资料回答问题：..."
         //   4. 把增强后的 Prompt 交给 LLM
+        SearchRequest.Builder search = SearchRequest.builder().topK(topK);
+        if (similarityThreshold > 0) {
+            search.similarityThreshold(similarityThreshold);
+        }
         this.ragAdvisor = QuestionAnswerAdvisor.builder(vectorStore)
-                .searchRequest(
-                        SearchRequest.builder()
-                                // topK(5)：检索时返回最相似的 5 个文档片段。
-                                //   - 调大：召回率提高，但 Prompt 变长，可能超出上下文窗口或引入噪声
-                                //   - 调小：精准度提高，但可能漏掉关键信息
-                                //   - 建议范围：3-8，根据你的文档密度调整
-                                .topK(5)
-                                // similarityThreshold(0.7)：相似度阈值（0-1）。
-                                //   - 只有相似度高于该值的片段才会被返回。
-                                //   - 调高（如 0.8）：只保留高度相关的片段，减少噪声
-                                //   - 调低（如 0.5）：召回更多片段，但可能引入无关内容
-                                //   - 注意：不同 Embedding 模型的分数分布不同，需要实测调整
-                                //   - 如果检索结果为空，可以适当降低这个阈值
-//                                .similarityThreshold(0.7)
-                                .build())
+                .searchRequest(search.build())
                 .build();
     }
 
