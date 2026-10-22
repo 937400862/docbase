@@ -54,43 +54,125 @@ flowchart LR
 
 ---
 
-## 三个被数据否决的方案
+## 快速开始
 
-这部分比功能列表更能说明问题：**判断一个方案该不该上，靠的是测量，不是直觉。**
+### 依赖
 
-### 1. 语义脱敏（用小模型再洗一遍文本）—— 否决
+| 组件 | 版本 | 说明 |
+|---|---|---|
+| JDK | 21+ | |
+| Redis Stack | 7.4+ | 需要 RediSearch，**普通 Redis 不行** |
+| Ollama | 最新 | 提供 embedding 与 chat |
 
-想法很自然：正则只能覆盖结构化信息，人名、机构名这类靠正则抓不全，那就让 LLM 再过一遍。
+### 三步跑起来
 
-四层实验全部做完，四层全否：
+```bash
+# 1. Redis Stack
+docker run -d --name redis-stack -p 6379:6379 redis/redis-stack-server:latest
 
-| 层 | 测什么 | 结果 |
-|:--:|---|---|
-| 1 | 单 chunk 耗时 | **17~34 秒/chunk**（生成速度 32.5 tok/s，是 3 GB 显存的硬件上限） |
-| 2 | 并发能不能救 | **不能**。并发请求排队，总吞吐不变 |
-| 3 | 缩短输出能不能加速 | **反而慢 2.7 倍**（让模型少说话，它反而生成更多思考过程） |
-| 4 | 质量够不够 | **人名召回只有 20%**（5 个名字只换掉 1 个），还会把正常业务字段名误替换成 `[PERSON]` |
+# 2. 模型（bge-m3 是嵌入，qwen2.5:3b 是问答）
+ollama pull bge-m3
+ollama pull qwen2.5:3b
 
-按 6.5 万个 chunk 算，需要 13~26 天。**结论：正则脱敏足够覆盖 IP / 账号 / 密钥这类结构化信息，语义脱敏不划算。**
+# 3. 构建并启动
+./mvnw package
+java -jar target/docbase-1.0.0.jar
+```
 
-代码里保留了完整实现，配置项 `rag.sanitize.ai-enabled` 默认 `false`，需要时可以对少量叙述性文档单独开启。
+默认连 `localhost:6379` 和 `localhost:11434`，向量索引会在启动时自动创建。
 
-### 2. 容量模型 —— 第一次估错了 40%
+> 显存不足 4 GB 时，官方模型的默认参数会 OOM 或速度骤降。参见 [ollama/](ollama/)，
+> 那里有实测调优过的 Modelfile（`num_gpu` 逐档实测数据），`ollama create` 一下就能用。
 
-最初用 `MEMORY USAGE` 采样求平均，得出"单 chunk 26.5 KB"，据此推算能装 4~5 万个 chunk。
+### 摄入与提问
 
-跑完 4,497 条真实数据后核对：`used_memory` 162.1 MB ÷ 4,497 = **36.9 KB**，而所有键的 `MEMORY USAGE` 合计只有 112.8 MB。
+```bash
+# 摄入整个目录（递归，幂等，重复执行不会产生重复 chunk）
+curl -X POST 'http://localhost:8800/api/ingest/dir' --data-urlencode 'path=/path/to/docs'
 
-差的 49.3 MB 全是 HNSW 索引 + 分配开销，**这部分不会出现在单键统计里**。
+# 提问
+curl 'http://localhost:8800/api/ask?question=报销流程有哪些审批节点'
+```
 
-### 3. 一次性提交整批嵌入 —— 吞吐塌陷
+---
 
-某个文件切出 686 个 chunk，一次性交给 embedding 模型，**17 分钟没有返回**，日志全无，看起来像卡死。
+## 接口
 
-改成每 64 条一批后，稳定在 0.18~0.3 秒/chunk，且每批都有进度可观测。
+| 方法 | 路径 | 参数 | 说明 |
+|---|---|---|---|
+| POST | `/api/ingest/file` | `path`、`mode=skip\|overwrite` | 摄入单个文件，`overwrite` 强制重摄 |
+| POST | `/api/ingest/dir` | `path` | 递归摄入目录，已完成的自动跳过 |
+| GET | `/api/ask` | `question` | RAG 问答（检索 + 生成） |
+| GET | `/api/chat` | `message` | 纯对话，不检索知识库 |
+| GET | `/api/maintenance/check` | `duplicates` | 体检：孤儿 / 残缺 / 重复 |
+| POST | `/api/maintenance/fix` | `limit` | 修复残缺（删掉重摄） |
+| GET | `/api/maintenance/top` | `n` | chunk 数最多的文件（找病态文件用） |
 
-> 顺便排除了一个看似合理的方案：给单文件加 chunk 数上限（比如 300）。实测会让文件不完整
-> （686 个只留 300，丢掉 56%），属于用数据完整性换性能，不能接受。现在靠分批解决，不靠截断。
+---
+
+## 配置
+
+所有连接信息都可以用环境变量覆盖，默认值指向本机：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis Stack 地址 |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 地址 |
+| `CHAT_MODEL` | `qwen2.5:3b` | 问答模型 |
+| `EMBEDDING_MODEL` | `bge-m3` | 嵌入模型，换它必须同步改 `dimensions` 并重建索引 |
+| `SANITIZE_MODEL` | `llama3.2:3b` | 语义脱敏模型（该功能默认关闭） |
+| `LOG_HOME` | `./logs` | 日志目录 |
+
+主要业务参数：
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `rag.ingest.embed-batch-size` | `64` | 单批嵌入条数，调大容易触发吞吐塌陷 |
+| `rag.ingest.max-redis-memory-mb` | `1000` | Redis 内存软上限，超限停止本批（已完成的文件重跑时自动跳过） |
+| `rag.ingest.progress-every` | `50` | 每多少个文件打一行进度 |
+| `rag.sanitize.ai-enabled` | `false` | 语义脱敏开关，默认关（原因见文末四层实验） |
+| `rag.maintenance.enabled` | `false` | 体检/修复定时任务，默认关（体检要扫全库的键） |
+
+本地开发想改这些值，新建 `src/main/resources/application-local.yaml`（已在 `.gitignore` 中），
+里面写的内容会覆盖上面的默认值，不需要每次启动传参数。
+
+### 脱敏模型为什么是 `llama3.2:3b` 而不是 qwen
+
+语义脱敏要做的是"把人名整体替换掉"。实测 qwen 系列会把中文姓名拆成"姓 + 名"两个 token：
+
+```
+输入  王建国和李秀兰上周去了北京出差。
+qwen2.5-3b  → [PERSON]建国和[PERSON]秀兰上周去了[ADDRESS]出差。   ❌ 只替换姓
+llama3.2-3b → [PERSON]和[PERSON]上周去了[ADDRESS]出差。           ✅ 整体替换
+```
+
+只替换姓属于**假脱敏**：看起来遮住了，实际仍能定位到人，比不替换更危险。所以脱敏单独用 llama3.2。
+
+代价是慢一些（19 vs 30 tok/s），但脱敏对准确性要求高于速度，这个取舍是划算的。
+
+> ⚠️ **如果打算开启语义脱敏（`rag.sanitize.ai-enabled=true`），先执行 `ollama pull llama3.2:3b`**，
+> 否则调用时会报模型不存在。这个功能默认关闭，不开启就完全不需要这个模型。
+
+---
+
+## 模型文件
+
+`ollama/` 目录下有两个 Modelfile，是在 3 GB 显存上调优过的参数版本：
+
+| 文件 | 创建的模型 | 用途 |
+|---|---|---|
+| `Modelfile-qwen2.5-3b-lowvram` | `qwen2.5-3b-lowvram` | 问答，`num_gpu 36` |
+| `Modelfile-llama3.2-3b-sanitize` | `llama3.2-3b-sanitize` | 语义脱敏，`num_gpu 28` + `temperature 0` |
+
+**不是必需的**——默认配置用官方标签就能跑。只有在显存吃紧时才需要它们：
+
+```bash
+ollama pull qwen2.5:3b
+ollama create qwen2.5-3b-lowvram -f ollama/Modelfile-qwen2.5-3b-lowvram
+```
+
+两个文件里都有逐档实测的 `num_gpu` → 显存占用 → tok/s 对照表，可以照着自己的显存挑。
+详细说明见 [ollama/README.md](ollama/README.md)。
 
 ---
 
@@ -169,98 +251,22 @@ metadata 分两级：`source`（文件名）每个 chunk 都存；`path` / `mtim
 
 ---
 
-## 快速开始
-
-### 依赖
-
-| 组件 | 版本 | 说明 |
-|---|---|---|
-| JDK | 21+ | |
-| Redis Stack | 7.4+ | 需要 RediSearch，普通 Redis 不行 |
-| Ollama | 最新 | 提供 embedding 与 chat |
-
-```bash
-# 1. Redis Stack
-docker run -d --name redis-stack -p 6379:6379 redis/redis-stack-server:latest
-
-# 2. 模型
-ollama pull bge-m3          # embedding，1024 维
-ollama pull qwen2.5:3b      # 问答，中文效果好且体积小
-```
-
-### 构建与启动
-
-```bash
-./mvnw package
-java -jar target/docbase-1.0.0.jar
-```
-
-默认连 `localhost:6379` 和 `localhost:11434`，索引会在启动时自动创建。
-
-### 摄入与提问
-
-```bash
-# 摄入整个目录（递归）
-curl -X POST 'http://localhost:8800/api/ingest/dir' --data-urlencode 'path=/path/to/docs'
-
-# 提问
-curl 'http://localhost:8800/api/ask?question=报销流程有哪些审批节点'
-```
-
----
-
-## 接口
-
-| 方法 | 路径 | 参数 | 说明 |
-|---|---|---|---|
-| POST | `/api/ingest/file` | `path`、`mode=skip\|overwrite` | 摄入单个文件，`overwrite` 强制重摄 |
-| POST | `/api/ingest/dir` | `path` | 递归摄入目录，幂等，已完成的自动跳过 |
-| GET | `/api/ask` | `question` | RAG 问答（检索 + 生成） |
-| GET | `/api/chat` | `message` | 纯对话，不检索知识库 |
-| GET | `/api/maintenance/check` | `duplicates` | 体检：孤儿 / 残缺 / 重复 |
-| POST | `/api/maintenance/fix` | `limit` | 修复残缺（删掉重摄） |
-| GET | `/api/maintenance/top` | `n` | chunk 数最多的文件（找病态文件用） |
-
----
-
-## 配置
-
-所有连接信息都可以用环境变量覆盖，默认值指向本机：
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis Stack 地址 |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 地址 |
-| `CHAT_MODEL` | `qwen2.5:3b` | 问答模型 |
-| `EMBEDDING_MODEL` | `bge-m3` | 嵌入模型，换它必须同步改 `dimensions` 并重建索引 |
-| `SANITIZE_MODEL` | `llama3.2:3b` | 语义脱敏模型（该功能默认关闭） |
-| `LOG_HOME` | `./logs` | 日志目录 |
-
-主要业务参数：
-
-| 配置项 | 默认 | 说明 |
-|---|---|---|
-| `rag.ingest.embed-batch-size` | `64` | 单批嵌入条数，调大容易触发吞吐塌陷 |
-| `rag.ingest.max-redis-memory-mb` | `1000` | Redis 内存软上限，超限停止本批（已完成的文件重跑时自动跳过） |
-| `rag.ingest.progress-every` | `50` | 每多少个文件打一行进度 |
-| `rag.sanitize.ai-enabled` | `false` | 语义脱敏开关，默认关（原因见上文四层实验） |
-| `rag.maintenance.enabled` | `false` | 体检/修复定时任务，默认关（体检要扫全库的键） |
-
----
-
 ## 项目结构
 
 ```
-src/main/java/com/zhu/docbase/
-├── DocbaseApplication.java
-├── controller/RagController.java            7 个 HTTP 接口
-├── job/RagMaintenanceJob.java               定时体检/修复（默认关闭）
-└── service/
-    ├── DocumentTextExtractor.java           按类型分流解析 + 目录清理 + 编码探测
-    ├── DocumentIngestionService.java        摄入编排：幂等、分批嵌入、内存上限
-    ├── SanitizeService.java                 正则脱敏（+ 可选的语义脱敏）
-    ├── RagChatService.java                  检索增强问答
-    └── RagMaintenanceService.java           孤儿 / 残缺 / 重复检测与修复
+├── ollama/                                  实测调优的 Modelfile（显存 < 4GB 时用）
+├── src/main/java/com/zhu/docbase/
+│   ├── DocbaseApplication.java
+│   ├── controller/RagController.java        7 个 HTTP 接口
+│   ├── job/RagMaintenanceJob.java           定时体检/修复（默认关闭）
+│   └── service/
+│       ├── DocumentTextExtractor.java       按类型分流解析 + 目录清理 + 编码探测
+│       ├── DocumentIngestionService.java    摄入编排：幂等、分批嵌入、内存上限
+│       ├── SanitizeService.java             正则脱敏（+ 可选的语义脱敏）
+│       ├── RagChatService.java              检索增强问答
+│       └── RagMaintenanceService.java       孤儿 / 残缺 / 重复检测与修复
+└── src/test/java/com/zhu/docbase/service/
+    └── SanitizeServiceTest.java             10 个脱敏规则用例（不依赖 Redis / Ollama）
 ```
 
 ---
@@ -273,6 +279,46 @@ src/main/java/com/zhu/docbase/
 - **幂等是单机单实例**，不是分布式
 - **文件改名会产生孤儿 chunk**，靠体检接口发现，需要手工清理
 - **Redis 只开 RDB 未开 AOF**，进程崩溃最多丢最近约 1 万个写入（重跑会自动补齐）
+
+---
+
+## 附：三个被数据否决的方案
+
+功能列表谁都能写，**判断一个方案该不该上，靠的是测量，不是直觉**。下面三个都是先想上、测完砍掉的。
+
+### 1. 语义脱敏（用小模型再洗一遍文本）—— 否决
+
+想法很自然：正则只能覆盖结构化信息，人名、机构名这类靠正则抓不全，那就让 LLM 再过一遍。
+
+四层实验全部做完，四层全否：
+
+| 层 | 测什么 | 结果 |
+|:--:|---|---|
+| 1 | 单 chunk 耗时 | **17~34 秒/chunk**（生成速度 32.5 tok/s，是 3 GB 显存的硬件上限） |
+| 2 | 并发能不能救 | **不能**。并发请求排队，总吞吐不变 |
+| 3 | 缩短输出能不能加速 | **反而慢 2.7 倍**（让模型少说话，它反而生成更多思考过程） |
+| 4 | 质量够不够 | **人名召回只有 20%**（5 个名字只换掉 1 个），还会把正常业务字段名误替换成 `[PERSON]` |
+
+按 6.5 万个 chunk 算，需要 13~26 天。**结论：正则脱敏足够覆盖 IP / 账号 / 密钥这类结构化信息，语义脱敏不划算。**
+
+代码里保留了完整实现，配置项 `rag.sanitize.ai-enabled` 默认 `false`，需要时可以对少量叙述性文档单独开启。
+
+### 2. 容量模型 —— 第一次估错了 40%
+
+最初用 `MEMORY USAGE` 采样求平均，得出"单 chunk 26.5 KB"，据此推算能装 4~5 万个 chunk。
+
+跑完 4,497 条真实数据后核对：`used_memory` 162.1 MB ÷ 4,497 = **36.9 KB**，而所有键的 `MEMORY USAGE` 合计只有 112.8 MB。
+
+差的 49.3 MB 全是 HNSW 索引 + 分配开销，**这部分不会出现在单键统计里**。
+
+### 3. 一次性提交整批嵌入 —— 吞吐塌陷
+
+某个文件切出 686 个 chunk，一次性交给 embedding 模型，**17 分钟没有返回**，日志全无，看起来像卡死。
+
+改成每 64 条一批后，稳定在 0.18~0.3 秒/chunk，且每批都有进度可观测。
+
+> 顺便排除了一个看似合理的方案：给单文件加 chunk 数上限（比如 300）。实测会让文件不完整
+> （686 个只留 300，丢掉 56%），属于用数据完整性换性能，不能接受。现在靠分批解决，不靠截断。
 
 ---
 
