@@ -93,6 +93,20 @@ public class RagController {
     }
 
     /**
+     * 【2026-10-23 新增】手动重建 BM25 索引。
+     *
+     * <p>摄入完成后索引会自动重建（走 {@code IngestCompletedEvent}），这个接口是兜底：
+     * 手工改了库、或者怀疑索引和库不一致时手动刷一次。同步执行，返回时保证是最新的。
+     */
+    @PostMapping("/bm25/rebuild")
+    public String rebuildBm25() {
+        long t0 = System.currentTimeMillis();
+        bm25IndexService.rebuild();
+        return "BM25 索引已重建：" + bm25IndexService.size() + " 条 chunk，耗时 "
+                + (System.currentTimeMillis() - t0) + " ms";
+    }
+
+    /**
      * 检索诊断：不调用 LLM，把候选片段原样返回。
      *
      * <p>为什么需要：/ask 只给最终答案，看不出"答不上"是因为没检索到，还是检索到了但模型没组织好。

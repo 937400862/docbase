@@ -3,6 +3,7 @@ package com.zhu.docbase.service;
 import com.huaban.analysis.jieba.JiebaSegmenter;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.zhu.docbase.event.IngestCompletedEvent;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -23,6 +24,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -42,8 +48,11 @@ import java.util.regex.Pattern;
  *
  * <h3>内存占用</h3>
  * 4,497 chunk：正文副本约 4 MB，倒排（24 万条 posting，每条 2 个 int）约 2 MB，
- * 词表 2.2 万项约 2 MB，合计约 10 MB。扩到 6.5 万 chunk 时会到约 150 MB，
- * 那时需要改成索引持久化 + 增量更新，见 AGENTS.md 第十五节。
+ * 词表 2.2 万项约 2 MB，合计约 10 MB，建索引约 3.4 秒。
+ *
+ * <p><b>规模上限</b>：扩到 6.5 万 chunk 时，全量重建约 1 分钟、内存约 150 MB。
+ * 那时"每次摄入后全量重建"会变慢，需要改成增量追加（只加新 doc 的 posting，
+ * 重算 idf）或索引持久化（序列化到磁盘，启动 mmap 加载）。现在不做。
  *
  * @author ：zhuzj
  * @date ：2026/10/23
@@ -90,6 +99,29 @@ public class Bm25IndexService {
 
     /** 不可变快照。重建时整体替换，读的一方永远看到完整的一份，不会读到半成品 */
     private volatile Index index;
+
+    /**
+     * 重建请求的合并开关。
+     *
+     * <p>为什么需要"安静期"而不是简单排队：目录摄入时事件是<b>分散在整个摄入过程</b>里来的
+     * （一个文件一次，间隔几百毫秒到几秒），如果收到就重建，2.8 秒一次会跟事件撞车 ——
+     * 实测 9 个文件触发了 5 次重建。所以改成"最后一次事件之后安静 QUIET_MS 才动手"，
+     * 摄入一结束只重建一次。
+     */
+    private final AtomicBoolean dirty = new AtomicBoolean(false);
+    private final AtomicBoolean rebuilding = new AtomicBoolean(false);
+    private final AtomicInteger pendingMarks = new AtomicInteger();
+    private final AtomicLong lastMarkAt = new AtomicLong(0);
+
+    /** 安静期：最后一次摄入事件之后等这么久才重建，把连续事件合并成一次 */
+    @Value("${rag.chat.bm25.rebuild-quiet-ms:3000}")
+    private long quietMs;
+
+    private final ExecutorService rebuildExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "bm25-reindex");
+        t.setDaemon(true);
+        return t;
+    });
 
     public Bm25IndexService(StringRedisTemplate redisTemplate) {
         this.redisTemplate = redisTemplate;
@@ -156,6 +188,64 @@ public class Bm25IndexService {
         Thread t = new Thread(this::rebuild, "bm25-index-builder");
         t.setDaemon(true);
         t.start();
+    }
+
+    /**
+     * 摄入完成后刷新索引。
+     *
+     * <p>只在真的写入了 chunk 时才发这个事件（见 {@code DocumentIngestionService}），
+     * 所以这里不用再判断。多次事件会被 {@link #markDirty()} 按"安静期"合并成一轮重建。
+     */
+    @EventListener
+    public void onIngestCompleted(IngestCompletedEvent event) {
+        if (!enabled || event.chunks() <= 0) {
+            return;
+        }
+        // 目录摄入会逐个文件触发，这里不能每条都打 INFO，否则几百行噪声
+        log.debug("摄入写入 {} 个片段，标记 BM25 索引待重建", event.chunks());
+        markDirty();
+    }
+
+    /**
+     * 标记需要重建。连续调用 N 次（只要间隔小于安静期）只会真正跑 1 轮。
+     *
+     * <p>重建期间 {@link #search} 读到的是旧快照（{@code index} 是 volatile 整体替换），
+     * 不会读到半成品，也不会阻塞查询。
+     */
+    public void markDirty() {
+        pendingMarks.incrementAndGet();
+        lastMarkAt.set(System.currentTimeMillis());
+        dirty.set(true);
+        if (rebuilding.compareAndSet(false, true)) {
+            rebuildExecutor.submit(this::drain);
+        }
+    }
+
+    private void drain() {
+        try {
+            while (true) {
+                // 等"最后一次事件之后安静 quietMs"，把摄入过程中的连续事件合并掉
+                while (System.currentTimeMillis() - lastMarkAt.get() < quietMs) {
+                    Thread.sleep(200);
+                }
+                dirty.set(false);
+                int marks = pendingMarks.getAndSet(0);
+                rebuild();
+                log.info("BM25 索引重建完成（本轮合并了 {} 次摄入事件）", marks);
+                if (!dirty.get()) {
+                    return;
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            rebuilding.set(false);
+            // 收尾竞态：刚好在 rebuilding 置 false 之后又来了一次 markDirty，
+            // 那次提交会因为 CAS 失败而丢掉，这里补一次
+            if (dirty.get()) {
+                markDirty();
+            }
+        }
     }
 
     /**

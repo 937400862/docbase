@@ -2,12 +2,14 @@ package com.zhu.docbase.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.zhu.docbase.event.IngestCompletedEvent;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.MDC;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -169,14 +171,27 @@ public class DocumentIngestionService {
     /** 【改动 2026-10-22】解析 JSON.GET / JSON.MGET 的返回，Jackson 由 spring-boot-starter-web 带进来 */
     private static final ObjectMapper JSON = new ObjectMapper();
 
+    /** 【改动 2026-10-23】摄入完成后发事件，让检索层（BM25 索引）自己决定要不要刷新 */
+    private final ApplicationEventPublisher eventPublisher;
+
+    /**
+     * 批量模式标记：目录摄入期间为 true，此时单文件摄入不发事件。
+     *
+     * <p>为什么用 ThreadLocal 而不是字段：{@code ingestDirectory} 在同一个线程里
+     * 逐个调 {@code ingestFile}，用 ThreadLocal 不会影响并发的单文件摄入请求。
+     */
+    private static final ThreadLocal<Boolean> BATCH_MODE = ThreadLocal.withInitial(() -> false);
+
     public DocumentIngestionService(VectorStore vectorStore,
                                     SanitizeService sanitizeService,
                                     DocumentTextExtractor textExtractor,
-                                    StringRedisTemplate redisTemplate) {
+                                    StringRedisTemplate redisTemplate,
+                                    ApplicationEventPublisher eventPublisher) {
         this.vectorStore = vectorStore;
         this.sanitizeService = sanitizeService;
         this.textExtractor = textExtractor;
         this.redisTemplate = redisTemplate;
+        this.eventPublisher = eventPublisher;
     }
 
     /**
@@ -708,6 +723,13 @@ public class DocumentIngestionService {
 
             log.info("完成: {} 个片段（hash={}）{}",
                     totalChunks, hash, useAi ? " 正则+AI脱敏" : " 仅正则脱敏");
+            // 【2026-10-23】通知检索层刷新关键词索引。
+            // 只在真的写入时发；"已摄入过而跳过""内容过短""失败"都不发。
+            // 目录摄入期间（BATCH_MODE=true）不发，由 ingestDirectory 在整批结束时发一次，
+            // 否则几百个文件会让检索层在摄入过程中反复重建。
+            if (!BATCH_MODE.get()) {
+                eventPublisher.publishEvent(new IngestCompletedEvent(totalChunks));
+            }
             return IngestResult.ok(totalChunks);
         } catch (Throwable t) {
             // 必须是 Throwable 而不是 Exception：
@@ -762,6 +784,9 @@ public class DocumentIngestionService {
 
         // 目录级日志用固定标签 DIR；路径由下面那行 === 开始递归摄入目录 === 打一次，不重复
         MDC.put("f", "DIR");
+
+        // 进入批量模式：整批只在最后发一次事件，避免摄入过程中反复重建索引
+        BATCH_MODE.set(true);
 
         try (Stream<Path> paths = Files.walk(rootPath)) {
             List<Path> fileList = paths
@@ -864,6 +889,14 @@ public class DocumentIngestionService {
         } catch (IOException e) {
             log.error("遍历目录失败: {} | 原因: {}", dirPath, e.getMessage());
             return 0;
+        } finally {
+            // 退出批量模式：之后单文件摄入恢复"每次发事件"
+            BATCH_MODE.remove();
+        }
+        // 整批只发一次事件。目录里 200 多个文件逐个发事件的话，
+        // 检索层会被迫在摄入过程中反复重建索引（实测 9 个文件触发 3 轮）。
+        if (totalChunks > 0) {
+            eventPublisher.publishEvent(new IngestCompletedEvent(totalChunks));
         }
         return totalChunks;
     }
