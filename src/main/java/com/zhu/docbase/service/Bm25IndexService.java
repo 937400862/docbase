@@ -240,10 +240,16 @@ public class Bm25IndexService {
             Thread.currentThread().interrupt();
         } finally {
             rebuilding.set(false);
-            // 收尾竞态：刚好在 rebuilding 置 false 之后又来了一次 markDirty，
-            // 那次提交会因为 CAS 失败而丢掉，这里补一次
-            if (dirty.get()) {
-                markDirty();
+            // 收尾竞态：窗口在「上面 if (!dirty.get()) 判断完」到「rebuilding 置 false」之间。
+            // 这期间到来的 markDirty，看到的 rebuilding 还是 true，CAS 失败 → 不会提交新任务，
+            // 而 drain 已经决定退出了，那次标记就没人处理。这里必须补一次。
+            //
+            // 注意不是"置 false 之后"：那之后到来的 markDirty 自己就能 CAS 成功并提交任务，
+            // 不需要补。所以这里用 CAS 而不是直接调 markDirty() ——
+            // 如果另一个线程已经抢到了（rebuilding 又变回 true），就交给它，
+            // 避免把 pendingMarks 重复计数。
+            if (dirty.get() && rebuilding.compareAndSet(false, true)) {
+                rebuildExecutor.submit(this::drain);
             }
         }
     }
