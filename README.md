@@ -5,6 +5,9 @@
 **English abstract** — docbase is a local-first RAG service that ingests messy Office documents
 (`.docx` / `.doc` / `.pdf` / `.xlsx` / `.txt` / `.log`) into a Redis vector index and answers questions
 against them. It runs entirely on your machine with Ollama for both embedding and generation.
+Retrieval is hybrid: vector search plus an in-process BM25 index (jieba tokenizer), fused with
+Reciprocal Rank Fusion — every design choice here was measured against a 30-question evaluation set,
+and the ones that failed are documented at the bottom.
 The interesting part is not the chat loop — it is the ingestion pipeline: structure-preserving table
 extraction, encoding fallback, TOC stripping, content-addressed idempotency, and a capacity model
 derived from measurement rather than guesswork.
@@ -22,6 +25,8 @@ derived from measurement rather than guesswork.
 | 单 chunk 嵌入耗时 | **0.18 ~ 0.3 秒** |
 | 每 1 万 chunk | ≈ 360 MB |
 | 单 chunk token 数 | **平均 532 / 最大 604**（jtokkit 实测，切分上限 600 生效） |
+| 检索命中（30 题，答案所在片段进 top-5） | **26/30**（纯向量 20/30 · 纯 BM25 25/30） |
+| BM25 索引 | 4,497 条 **3.4 秒**建完，内存约 10 MB，单次查询 **<10 ms** |
 
 > **为什么是 36.9 KB 而不是 26.3 KB**：单条 chunk 的 JSON 键用 `MEMORY USAGE` 量出来是 26,298 字节，
 > 但 `used_memory ÷ 条数` 是 36.9 KB。差的约 10.3 KB/chunk 是 HNSW 索引和分配开销。
@@ -43,13 +48,16 @@ flowchart LR
     E --> F
 
     F --> G["正则脱敏<br/>IP · 账号 · 密钥 · 身份证 · 银行卡"]
-    G --> H["Token 切分<br/>800 token / overlap 100"]
+    G --> H["Token 切分<br/>600 token / 最小块 200 字符"]
     H --> I["分批嵌入<br/>bge-m3 · 64 条/批"]
     I --> J[("Redis Stack<br/>HNSW · COSINE · 1024 维")]
 
-    Q[用户提问] --> K["向量检索 topK=5"]
-    J --> K
-    K --> L["QuestionAnswerAdvisor<br/>检索结果注入 Prompt"]
+    Q[用户提问] --> K1["向量检索<br/>top-20"]
+    Q --> K2["BM25 检索<br/>jieba 内存倒排 · top-20"]
+    J --> K1
+    K1 --> R["RRF 融合<br/>Σ 1/(60+排名)"]
+    K2 --> R
+    R --> L["取 top-5<br/>填 Prompt 模板"]
     L --> M["LLM 生成"]
 ```
 
@@ -103,8 +111,11 @@ curl 'http://localhost:8800/api/ask?question=报销流程有哪些审批节点'
 |---|---|---|---|
 | POST | `/api/ingest/file` | `path`、`mode=skip\|overwrite` | 摄入单个文件，`overwrite` 强制重摄 |
 | POST | `/api/ingest/dir` | `path` | 递归摄入目录，已完成的自动跳过 |
-| GET | `/api/ask` | `question` | RAG 问答（检索 + 生成） |
+| GET | `/api/ask` | `question` | RAG 问答（混合检索 + 生成） |
 | GET | `/api/chat` | `message` | 纯对话，不检索知识库 |
+| GET | `/api/retrieve` | `question`、`topK`、`vectorOnly` | 检索诊断：只检索不生成，看候选原文；`vectorOnly=true` 对比纯向量 |
+| GET | `/api/retrieve-hybrid` | `question`、`recallK` | 并排显示向量名次 / BM25 名次 / 融合结果，排查"某题为什么没命中" |
+| POST | `/api/bm25/rebuild` | — | 手动重建 BM25 索引（摄入后会自动重建，这个是兜底） |
 | GET | `/api/maintenance/check` | `duplicates` | 体检：孤儿 / 残缺 / 重复 |
 | POST | `/api/maintenance/fix` | `limit` | 修复残缺（删掉重摄） |
 | GET | `/api/maintenance/top` | `n` | chunk 数最多的文件（找病态文件用） |
@@ -130,8 +141,12 @@ curl 'http://localhost:8800/api/ask?question=报销流程有哪些审批节点'
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
-| `rag.chat.top-k` | `5` | 检索片段数。受 `num-ctx` 硬约束，且不是越大越好（见文末已知限制） |
-| `rag.chat.similarity-threshold` | `0` | 相似度阈值，0 = 不过滤 |
+| `rag.chat.top-k` | `5` | 最终喂给模型的片段数。受 `num-ctx` 硬约束，且不是越大越好（见文末已知限制） |
+| `rag.chat.recall-k` | `20` | 每路召回的候选数（融合的输入，不直接进提示词） |
+| `rag.chat.rrf-k` | `60` | RRF 的 k。越小头部权重越大，60 是原论文经验值 |
+| `rag.chat.bm25.enabled` | `true` | 关键词这一路的开关，关掉退化为纯向量 |
+| `rag.chat.bm25.rebuild-quiet-ms` | `3000` | 摄入事件后等多久安静再重建索引（合并连续摄入） |
+| `rag.chat.prompt-file` | `prompts/qa.txt` | 问答提示词模板（classpath） |
 | `rag.ingest.embed-batch-size` | `64` | 单批嵌入条数，调大容易触发吞吐塌陷 |
 | `rag.ingest.max-redis-memory-mb` | `1000` | Redis 内存软上限，超限停止本批（已完成的文件重跑时自动跳过） |
 | `rag.ingest.progress-every` | `50` | 每多少个文件打一行进度 |
@@ -256,19 +271,77 @@ metadata 分两级：`source`（文件名）每个 chunk 都存；`path` / `mtim
 
 ---
 
+## 混合检索：向量 + BM25，用 RRF 融合
+
+### 为什么要两路
+
+同一批问题里，两类失败模式是互补的：
+
+- 有些题的正确答案被向量排到 12~17 名（`topK=5` 根本看不到），而关键词能排到第 1
+- 反过来也有题向量命中、关键词排到 60 名之外
+
+所以两路各召回 20 条，融合后**仍然只喂 5 条**——候选池变宽，提示词长度不变。
+
+### 为什么不用 Redis 自带的全文检索
+
+`$.content` 本来就是 TEXT 字段，建索引时加 `LANGUAGE chinese` 就能中文检索，看起来零成本。
+实测只有 **19/30** 命中 top-5，比纯向量（20/30）还差——Friso 对中文复合词的切分质量明显不如 jieba。
+
+所以用 jieba-analysis 在 JVM 里建内存倒排：4,497 条 **3.4 秒**建完，约 10 MB，查询 **<10 ms**。
+
+### RRF 是什么
+
+```
+score(d) = Σ_i  1 / (k + rank_i(d))        k = 60
+```
+
+只使用**排名**，不使用分数：向量是 cosine（0~1，集中在 0.5~0.8），BM25 是无上界分值，
+两者尺度不可比；排名天然可比，不需要归一化假设。
+
+它奖励"两路都还行"，惩罚"一路极好、另一路没有"：向量第 1 名 + BM25 第 26 名（超出 top-20 不计分）
+只得 1/61≈0.0164，会被"向量第 5 + BM25 第 3"（1/65+1/63≈0.0313）压过。
+**实测有 3 道题因此变差，这是融合的固有特性，不是 bug。**
+
+### 实测（30 题评测集，答案所在片段是否进 top-5）
+
+| 方案 | 精确 | 泛问 | 合计 | 单次查询增量耗时 |
+|---|:--:|:--:|:--:|:--:|
+| 纯向量 | 6/15 | 14/15 | **20/30** | 0 |
+| 纯 BM25 | 11/15 | 14/15 | **25/30** | ~10 ms |
+| **RRF 融合** | 11/15 | 15/15 | **26/30** | ~10 ms |
+| cross-encoder 重排 | 13/15 | 13/15 | 26/30 | **35 秒** |
+| RRF + 重排 | 11/15 | 14/15 | 25/30 | **35 秒** |
+
+端到端答案覆盖率：泛问 38% → **49%**，精确 41% → 38%（检索更准了，但部分答案没有原样命中
+关键字符串；纯向量三次实测分别是 28%/41%/38%，本身波动较大）。
+
+### 索引刷新
+
+摄入完成后自动重建（走 `IngestCompletedEvent` 事件）：
+
+- **目录摄入**期间不发事件，整批结束发一次（否则 200 多个文件会触发 200 多次重建）
+- **单文件摄入**每次发一次，但有 3 秒安静期防抖，连续的多次摄入会合并成一轮
+
+重建在独立线程，`index` 是 volatile 整体替换——查询读到的是旧快照，不阻塞、也不会读到半成品。
+
+---
+
 ## 项目结构
 
 ```
 ├── ollama/                                  实测调优的 Modelfile（显存 < 4GB 时用）
 ├── src/main/java/com/zhu/docbase/
 │   ├── DocbaseApplication.java
-│   ├── controller/RagController.java        7 个 HTTP 接口
+│   ├── controller/RagController.java        10 个 HTTP 接口
+│   ├── event/IngestCompletedEvent.java      摄入完成事件（触发索引刷新）
 │   ├── job/RagMaintenanceJob.java           定时体检/修复（默认关闭）
 │   └── service/
 │       ├── DocumentTextExtractor.java       按类型分流解析 + 目录清理 + 编码探测
 │       ├── DocumentIngestionService.java    摄入编排：幂等、分批嵌入、内存上限
 │       ├── SanitizeService.java             正则脱敏（+ 可选的语义脱敏）
-│       ├── RagChatService.java              检索增强问答
+│       ├── Bm25IndexService.java            内存倒排 + BM25 打分（jieba 分词）
+│       ├── HybridRetriever.java             向量 + BM25 → RRF → top-5
+│       ├── RagChatService.java              填模板 + 调用模型
 │       └── RagMaintenanceService.java       孤儿 / 残缺 / 重复检测与修复
 └── src/test/java/com/zhu/docbase/service/
     └── SanitizeServiceTest.java             10 个脱敏规则用例（不依赖 Redis / Ollama）
@@ -278,22 +351,27 @@ metadata 分两级：`source`（文件名）每个 chunk 都存；`path` / `mtim
 
 ## 已知限制
 
-- **泛问能力弱**。"X 是怎么做的"这类开放问题容易答不上，具体问题答得好。
-  原因是 `topK=5` + 3B 模型的组合限制——数据是够的（全库有 893 个 chunk 含目标关键词），
-  是检索宽度和模型能力的矛盾。
-  **调大 topK 试过了，不行**：实测 `topK=8` 泛问确实变好，但精确问答从 3/3 答对掉到 0/3——
-  3B 模型在 8 个片段里会丢针。真正的解法是 rerank（宽召回 + 重排回 5），
-  但那要多一个 reranker 模型，3 GB 显存放不下
+- **答案覆盖率只有 4 成左右**。30 题评测集里，答案所在片段进 top-5 的有 26/30，
+  但模型最终答案命中关键字符串的只有 **精确 38% / 泛问 49%**。
+  剩下那部分不是检索问题——材料已经递到手边了，是 3B 模型在 5 个片段里做跨段归纳的能力上限
+- **`topK` 不能靠加大来解决**。实测 `topK=8`：泛问变好，但精确问答从 3/3 答对掉到 0/3，
+  3B 模型在 8 个片段里会丢针。所以走的是"宽召回 + 融合压缩"，而不是往提示词里塞更多片段
+- **`.xlsx` 表格仍是"单元格墙"**。1332 个 chunk（占 29.6%），脱敏后占位符密度是 `.docx` 的 26 倍，
+  模型拿到也难组织成答案。结构化抽取还没做，是下一个待办
+- **有两道题检索层救不了**：一道是源文件正文几乎为空（被"内容过短"跳过，答案只写在文件名里），
+  一道是答案只写在文件名中（向量排第 16、关键词排第 60）
 - **`.doc` / `.pdf` 表格仍是拍平的**，只有 `.docx` 做了结构还原
+- **BM25 索引是全量重建**。摄入后会自动重建（单文件/目录各触发一次），
+  但扩到 6.5 万 chunk 时重建要 1 分钟左右，那时需要改成增量追加或索引持久化
 - **幂等是单机单实例**，不是分布式
 - **文件改名会产生孤儿 chunk**，靠体检接口发现，需要手工清理
 - **Redis 只开 RDB 未开 AOF**，进程崩溃最多丢最近约 1 万个写入（重跑会自动补齐）
 
 ---
 
-## 附：三个被数据否决的方案
+## 附：四个被数据否决的方案
 
-功能列表谁都能写，**判断一个方案该不该上，靠的是测量，不是直觉**。下面三个都是先想上、测完砍掉的。
+功能列表谁都能写，**判断一个方案该不该上，靠的是测量，不是直觉**。下面四个都是先想上、测完砍掉的。
 
 ### 1. 语义脱敏（用小模型再洗一遍文本）—— 否决
 
@@ -328,6 +406,29 @@ metadata 分两级：`source`（文件名）每个 chunk 都存；`path` / `mtim
 
 > 顺便排除了一个看似合理的方案：给单文件加 chunk 数上限（比如 300）。实测会让文件不完整
 > （686 个只留 300，丢掉 56%），属于用数据完整性换性能，不能接受。现在靠分批解决，不靠截断。
+
+### 4. cross-encoder 重排 —— 否决
+
+想法很标准：宽召回 20 条，用 cross-encoder 逐对打分重排回 5 条。这是教科书做法，
+问过的 8 个模型里有 7 个推荐它。
+
+实测 `bge-reranker-v2-m3`（568M，CPU 8 线程，截断 512）：
+
+| 项 | 值 |
+|---|---|
+| 单对耗时 | **1.6 秒** |
+| 单题（20 候选） | **26~44 秒** |
+| 精确题 top-5 | 6/15 → **13/15**（确实有效） |
+| 泛问题 top-5 | 14/15 → 13/15（退步） |
+| **叠在 RRF 上** | 26/30 → **25/30**（反而更差） |
+
+两个原因：
+
+1. **RRF 已经牺牲了单路长尾**。有些题向量排第 1 但关键词排第 60，融合后掉到第 11 ——
+   重排只能在融合后的池子里调整，救不回来
+2. **池子越干净，重排的扰动越像噪声**。有两道题本来融合后排第 2、第 4，重排后掉到第 8、第 11
+
+单题多 35 秒，收益为负。否掉。
 
 ---
 
