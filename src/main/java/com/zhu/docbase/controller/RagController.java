@@ -1,6 +1,8 @@
 package com.zhu.docbase.controller;
 
+import com.zhu.docbase.service.Bm25IndexService;
 import com.zhu.docbase.service.DocumentIngestionService;
+import com.zhu.docbase.service.HybridRetriever;
 import com.zhu.docbase.service.RagChatService;
 import com.zhu.docbase.service.RagMaintenanceService;
 import org.springframework.ai.document.Document;
@@ -25,33 +27,96 @@ public class RagController {
     private final RagMaintenanceService maintenanceService;
     /** 【改动 2026-10-22】给 /retrieve 用：直接看检索结果，不经过 LLM */
     private final VectorStore vectorStore;
+    /** 【改动 2026-10-23】混合检索与 BM25 索引诊断 */
+    private final HybridRetriever hybridRetriever;
+    private final Bm25IndexService bm25IndexService;
 
     public RagController(DocumentIngestionService ingestionService,
                          RagChatService ragChatService,
                          RagMaintenanceService maintenanceService,
-                         VectorStore vectorStore) {
+                         VectorStore vectorStore,
+                         HybridRetriever hybridRetriever,
+                         Bm25IndexService bm25IndexService) {
         this.ingestionService = ingestionService;
         this.ragChatService = ragChatService;
         this.maintenanceService = maintenanceService;
         this.vectorStore = vectorStore;
+        this.hybridRetriever = hybridRetriever;
+        this.bm25IndexService = bm25IndexService;
     }
 
     /**
-     * 【2026-10-22 新增】检索诊断：只做向量检索，不调用 LLM，把候选片段原样返回。
+     * 【2026-10-23 新增】混合检索诊断：把「向量名次 / BM25 名次 / RRF 融合结果」并排打出来。
+     *
+     * <p>用途：验证 Java 版的 BM25 名次与离线评测（Python jieba）是否一致。
+     * 两边分词器不同（jieba-analysis vs Python jieba），如果名次差异很大，
+     * 说明分词不一致，离线测出来的 26/30 就不能直接当作上线后的预期。
+     *
+     * @param question 问题
+     * @param recallK  每路召回多少条，默认 20（与线上一致）
+     */
+    @GetMapping("/retrieve-hybrid")
+    public String retrieveHybrid(@RequestParam String question,
+                                 @RequestParam(defaultValue = "20") int recallK) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("BM25 索引: ").append(bm25IndexService.isReady()
+                ? "就绪，" + bm25IndexService.size() + " 条" : "未就绪（本次退化为纯向量）").append("\n\n");
+
+        var debug = hybridRetriever.debug(question, recallK);
+        List<String> vec = debug.getOrDefault("vector", List.of());
+        List<String> kw = debug.getOrDefault("bm25", List.of());
+        sb.append("--- 向量 top").append(recallK).append(" ---\n");
+        for (int i = 0; i < vec.size(); i++) {
+            sb.append(i + 1).append(". ").append(vec.get(i)).append('\n');
+        }
+        sb.append("\n--- BM25 top").append(recallK).append(" ---\n");
+        for (int i = 0; i < kw.size(); i++) {
+            sb.append(i + 1).append(". ").append(kw.get(i)).append('\n');
+        }
+
+        sb.append("\n--- RRF 融合后喂给模型的片段 ---\n");
+        List<Document> fused = hybridRetriever.retrieve(question);
+        for (int i = 0; i < fused.size(); i++) {
+            Document d = fused.get(i);
+            sb.append(i + 1).append(". ").append(d.getId())
+                    .append("  | 向量").append(pos(vec, d.getId()))
+                    .append(" BM25").append(pos(kw, d.getId()))
+                    .append('\n').append(d.getText()).append("\n\n");
+        }
+        return sb.toString();
+    }
+
+    /** 名次展示：不在这一路里就显示「—」，不要显示 0（0 容易被误读成"排第 0 名"） */
+    private static String pos(List<String> list, String id) {
+        int i = list.indexOf(id);
+        return i < 0 ? "—" : "#" + (i + 1);
+    }
+
+    /**
+     * 检索诊断：不调用 LLM，把候选片段原样返回。
      *
      * <p>为什么需要：/ask 只给最终答案，看不出"答不上"是因为没检索到，还是检索到了但模型没组织好。
      * 评测集要判断一道题的 gold 到底在不在 top-20 候选里，只能靠这个接口。
      *
-     * @param question 问题
-     * @param topK     返回多少个候选，默认 20（比问答时的 5 宽，用于观察召回上限）
+     * <p>【2026-10-23 改动】默认改走混合检索（向量 + BM25 → RRF），
+     * 因为这才是 /ask 实际用的路径 —— 评测必须量真实行为，不能量一个已经不在用的旧链路。
+     * 要对比纯向量，加 {@code vectorOnly=true}。
+     *
+     * @param question   问题
+     * @param topK       返回多少个候选，默认 20（比问答时的 5 宽，用于观察召回上限）
+     * @param vectorOnly 只看纯向量检索（2026-10-23 之前的链路）
      */
     @GetMapping("/retrieve")
     public String retrieve(@RequestParam String question,
-                           @RequestParam(defaultValue = "20") int topK) {
-        List<Document> docs = vectorStore.similaritySearch(
-                SearchRequest.builder().query(question).topK(topK).build());
+                           @RequestParam(defaultValue = "20") int topK,
+                           @RequestParam(defaultValue = "false") boolean vectorOnly) {
+        List<Document> docs = vectorOnly
+                ? vectorStore.similaritySearch(
+                        SearchRequest.builder().query(question).topK(topK).build())
+                : hybridRetriever.retrieveFused(question, topK);
         StringBuilder sb = new StringBuilder();
-        sb.append("命中 ").append(docs.size()).append(" 个候选\n\n");
+        sb.append("命中 ").append(docs.size()).append(" 个候选")
+                .append(vectorOnly ? "（纯向量）" : "（混合检索：向量+BM25→RRF）").append("\n\n");
         for (int i = 0; i < docs.size(); i++) {
             Document d = docs.get(i);
             sb.append("### RANK ").append(i + 1)

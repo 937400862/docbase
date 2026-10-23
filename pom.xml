@@ -100,6 +100,20 @@
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-vector-store-advisor</artifactId>
         </dependency>
+
+        <!--
+            中文分词，给 BM25 关键词检索用。
+            为什么不用 Redis 自带的全文检索（LANGUAGE chinese + SCORER BM25）：
+              实测 30 题只有 19/30 命中 top-5，比纯向量（20/30）还差 ——
+              Friso 对中文复合词的切分质量明显不如 jieba，业务术语尤其明显。
+            jieba-analysis 是 Python jieba 的 Java 移植，切词结果与离线评测（Python 版）
+            基本一致，所以离线测出来的 26/30 才有参考价值。
+        -->
+        <dependency>
+            <groupId>com.huaban</groupId>
+            <artifactId>jieba-analysis</artifactId>
+            <version>1.0.2</version>
+        </dependency>
     </dependencies>
 
     <build>
