@@ -41,14 +41,17 @@ import java.util.regex.Pattern;
  *       内容彻底丢掉，日志里只有一行"已摄入 0 个片段"。</li>
  * </ol>
  *
- * <p>所以这里按扩展名分三条路：
+ * <p>所以这里按扩展名分四条路：
  * <table border="1">
  *   <tr><th>类型</th><th>走哪条路</th><th>为什么</th></tr>
  *   <tr><td>.docx</td><td>{@link #readDocx(File)}（POI 遍历 body）</td>
  *       <td>表格能还原成 markdown 行；目录在 POI 里本来就抽不到，天然干净</td></tr>
+ *   <tr><td><b>.xlsx / .xls</b>（2026-10-23 新增）</td><td>{@link XlsxTextExtractor}</td>
+ *       <td>POI 结构化抽取：表头定位 + 合并单元格回填 + 多级表头拼接 + 裁全空列 + 元信息行。
+ *           Tika 的单元格墙会让 1,569 格合并数据只剩左上角有值</td></tr>
  *   <tr><td>纯文本类（java/txt/md/sql/json...）</td><td>{@link #readPlainText(File)}</td>
  *       <td>自己按 UTF-8 → GB18030 兜底解码，避免 GBK 丢数据；顺带比 Tika 快很多</td></tr>
- *   <tr><td>其余（.doc/.pdf/.xls/.ppt...）</td><td>{@link #readWithTika(File)}</td>
+ *   <tr><td>其余（.doc/.pdf/.ppt...）</td><td>{@link #readWithTika(File)}</td>
  *       <td>二进制格式只能靠 Tika，且必须跑在 8MB 栈的线程里（见方法注释）</td></tr>
  * </table>
  *
@@ -92,8 +95,28 @@ public class DocumentTextExtractor {
     /** docx 走 POI 表格还原这条路 */
     private static final Set<String> DOCX_EXTS = Set.of("docx");
 
+    /**
+     * 【2026-10-23 新增】xlsx / xls 走 {@link XlsxTextExtractor}（POI 结构化抽取）。
+     *
+     * <p>从"其余格式"里拆出来单独走，理由见 {@link XlsxTextExtractor} 的类注释：
+     * Tika 会把 xlsx 拍成单元格墙，表头、合并、列关系全丢，1,569 格合并数据只有左上角有值。
+     */
+    private static final Set<String> XLSX_EXTS = Set.of("xlsx", "xls");
+
     /** POI 抽出来的文本少于这个长度时，认为 POI 没读到东西，退回 Tika 兜底 */
     private static final int POI_MIN_CHARS = 50;
+
+    /**
+     * 【2026-10-23 新增】xlsx 结构化抽取器。
+     *
+     * <p>做成独立组件而不是内联方法，一是本类已经 460 行、再加 300 行表格逻辑会失控，
+     * 二是验收脚本（{@code tools/XlsxCheck.java}）要直接 new 它来量"合并导致的空值占比"。
+     */
+    private final XlsxTextExtractor xlsxTextExtractor;
+
+    public DocumentTextExtractor(XlsxTextExtractor xlsxTextExtractor) {
+        this.xlsxTextExtractor = xlsxTextExtractor;
+    }
 
     /**
      * 抽取文件正文。
@@ -128,12 +151,32 @@ public class DocumentTextExtractor {
             return readWithTika(file);
         }
 
-        // ---------- 路线 2：纯文本 → 自己解码，UTF-8 失败按 GB18030 兜底 ----------
+        // ---------- 路线 2：xlsx / xls → POI 结构化抽取（表头定位 + 合并回填 + 元信息行） ----------
+        // 【2026-10-23 新增】这是"阶段 1：结构修复"的入口。与 docx 一样带 Tika 兜底：
+        // POI 读不出东西（加密、损坏、极端格式）时不能把文件判成失败，退回 Tika 至少还能拿到一部分。
+        if (XLSX_EXTS.contains(ext)) {
+            XlsxTextExtractor.Result result = null;
+            try {
+                result = xlsxTextExtractor.extract(file);
+            } catch (Throwable t) {
+                log.warn("POI 解析 xlsx 失败（{}），退回 Tika 兜底: {}", t.toString(), name);
+            }
+            if (result != null && result.text().strip().length() >= POI_MIN_CHARS) {
+                return result.text();
+            }
+            if (result != null) {
+                log.warn("POI 抽取 xlsx 内容过少（{} 字符，{} 个有效 sheet），退回 Tika 兜底: {}",
+                        result.text().strip().length(), result.stats().sheets(), name);
+            }
+            return readWithTika(file);
+        }
+
+        // ---------- 路线 3：纯文本 → 自己解码，UTF-8 失败按 GB18030 兜底 ----------
         if (PLAIN_TEXT_EXTS.contains(ext)) {
             return readPlainText(file);
         }
 
-        // ---------- 路线 3：其余二进制格式 → Tika（大栈线程） ----------
+        // ---------- 路线 4：其余二进制格式 → Tika（大栈线程） ----------
         return readWithTika(file);
     }
 
