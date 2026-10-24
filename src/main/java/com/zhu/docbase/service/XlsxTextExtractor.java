@@ -16,8 +16,10 @@ import java.io.File;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -34,29 +36,32 @@ import java.util.regex.Pattern;
  *   <li>大量全空列（某表 33 列里大半是空的），裁掉能省 token 也能降噪。</li>
  * </ul>
  *
- * <p><b>改造要点四条</b>：xlsx 不再走 Tika 改走 POI、合并单元格必须回填、
- * 表头定位是前置条件、每块写元信息行。本类就是这四条的实现。
+ * <p><b>渲染格式：行级键值</b>。一条记录一行，形如 {@code 列名: 值 | 列名: 值}。
+ * 依据是 43 题四臂对照：行级键值 60.4%、单元格墙+回填 43.8%，同题配对 t=−2.5；
+ * 代价是 chunk 约 1.7 倍（1,382 → 约 2,300）。与实验脚本 {@code 评测/测xlsx格式-RRF.py}
+ * 的 B 臂逐字对应，实验结论可以直接对上生产。
  *
- * <p><b>渲染格式</b>：保持「单元格墙」（每格一行）+ 顶部两行元信息。故意不做行级键值化
- * （那是阶段 2，前置条件未满足），也不做 Markdown 表格（实测更差：top-5 命中 6/8 vs 7/8）。
- * 与实验脚本 {@code 评测/测xlsx格式-RRF.py} 的 A2 臂保持一致，这样实验结论能直接对上生产。
+ * <p>之前用「单元格墙」（每格一行）：墙把行内关系拍平，模型拿不到"哪个值属于哪一列"。
+ * 单记录表还勉强能用，多记录表上直接散架 —— 这是这次换渲染格式的唯一理由。
  *
  * <p><b>唯一的例外是转置表</b>（字段名在行、记录在列）：这类表套单元格墙或行级键值都会散架，
  * 所以先认出来，改走"一条记录一行"的键值渲染，见 {@link #renderTransposed}。
- * 全库实测只有 1 张这样的表，判据刻意做窄，认不出来就退回单元格墙，不会比原来更差。
+ * 全库实测只有 1 张这样的表，判据刻意做窄，认不出来就退回行级键值，不会比原来更差。
  *
  * <pre>
  * 【表】某表.xlsx｜sheet: 主机层面｜列: 问题编号、安全要求、安全层面、…
  * 表头: 问题编号 | 安全要求 | 安全层面 | …
- * T01
- * 通用
- * 安全管理制度
- * …
+ * 问题编号: T01 | 安全要求: 通用 | 安全层面: 安全管理制度
+ * 问题编号: T02 | 安全要求: 口令强度 | 安全层面: 身份鉴别
  * </pre>
  *
- * <p><b>一个已知局限</b>：元信息行和表头行只在 sheet 的第一块里出现。
- * 切分器（TokenTextSplitter）按 token 预算切，跨块之后就看不到表头了——
- * 这要靠阶段 2「按行切、一行不跨块」解决，本阶段不做。
+ * <p><b>一个已知局限</b>：元信息行和表头行只在 sheet 的第一块里出现，切块之后看不到。
+ * 记录本身自带键名，所以"这条记录是什么"不受影响，受影响的是"这张表有哪些列"这类问题。
+ * 离线实验的每个块都带一行表头，生产没有 —— 生产实测可能低于离线臂的 65.5%，差的这部分就是它。
+ *
+ * <p><b>超长记录</b>：单条记录超过 {@link #RECORD_SOFT_LIMIT} 时改成"一个字段一行"。
+ * 实测 13,231 条记录里只有 53 条（0.40%）超线，最大 4,291 字；不处理的话切块器会把它拦腰切断，
+ * 续块开头没有键名。
  *
  * @author ：zhuzj（2026-10-23 新增）
  */
@@ -126,6 +131,19 @@ public class XlsxTextExtractor {
 
     /** 单条记录的字符数告警线。超过它就要担心切块时一条记录被拆到两个块里 */
     private static final int TRANSPOSE_RECORD_WARN_LEN = 400;
+
+    /**
+     * 单条记录的字符数软上限。超过就改成「一个字段一行」。
+     *
+     * <p>为什么是 700：xlsx 走 600 token 的切块预算，实测 1 token ≈ 1.21 字符
+     * （生产 xlsx 块平均 727 字，对应 600 token），700 字已经贴着预算上限。
+     * 一条记录超过它就会被切块器拦腰切断，而续块开头没有键名；
+     * 改成按字段换行后，切点落在字段之间，每段仍自带键名。
+     *
+     * <p>实测分布：中位 148 字、p90 176、p99 494，超线只有 53 条（0.40%）。
+     * 所以这条分支是兜底，不是主路径。
+     */
+    private static final int RECORD_SOFT_LIMIT = 700;
 
     /**
      * 纯整数（序号）。带小数点的不算——序号列不会写成 {@code 1.0}。
@@ -446,6 +464,12 @@ public class XlsxTextExtractor {
                     }
                 }
 
+                // 列名清洗：空列名补成 列N，重名加 #2/#3。
+                // 键值渲染里列名就是键，空键会渲染出 ": 14" 这种没有语义的片段；
+                // 重名则让两个不同的值顶着同一个键（实测某表是左右并排两张表，
+                // 表头各有一组同名参数列），模型无法区分是左边那张还是右边那张。
+                header = normalizeHeader(header, maxWidth);
+
                 // ---------- 6. 渲染 ----------
                 List<List<String>> body = rows.subList(Math.min(bodyStart, rows.size()), rows.size());
                 if (body.isEmpty()) {
@@ -470,16 +494,36 @@ public class XlsxTextExtractor {
                     appendPreamble(sb, rows.get(r));
                 }
 
-                // 表头行：单元格墙本身不带列名，没有这行模型无法把值对应到列
+                // 表头行：留一行列名清单，便于回答"这张表有哪些列"这类问题。
+                // 每条记录自带键名，所以它不是记录可读的前提，只是补一个表级视图。
                 sb.append("表头: ").append(String.join(" | ", header)).append('\n');
 
                 for (List<String> row : body) {
-                    for (String cell : row) {
-                        if (!cell.isEmpty()) {
-                            sb.append(cell).append('\n');
-                            nonEmptyCells++;
-                        } else {
+                    // 行级键值：一条记录一行，字段之间用 | 分隔。
+                    //
+                    // 空值直接跳过、不写占位：键值化的目的是让"哪个值属于哪一列"显式可读，
+                    // 空列本来就没有值可归属，写 "-" 只是浪费 token。
+                    // （列式渲染必须占位，因为那边靠位置对齐；这边靠键名，不需要。）
+                    List<String> parts = new ArrayList<>(maxWidth);
+                    for (int c = 0; c < maxWidth; c++) {
+                        String cell = c < row.size() ? row.get(c) : "";
+                        if (cell.isEmpty()) {
                             emptyCells++;
+                            continue;
+                        }
+                        nonEmptyCells++;
+                        parts.add(header.get(c) + ": " + cell);
+                    }
+                    if (parts.isEmpty()) {
+                        continue;
+                    }
+                    String record = String.join(" | ", parts);
+                    if (record.length() <= RECORD_SOFT_LIMIT) {
+                        sb.append(record).append('\n');
+                    } else {
+                        // 超长记录：按字段拆行，让切块落在字段边界上
+                        for (String part : parts) {
+                            sb.append(part).append('\n');
                         }
                     }
                 }
@@ -513,6 +557,35 @@ public class XlsxTextExtractor {
      * @param noCache 公式无缓存值的计数器（长度 1 的数组，充当 out 参数）
      * @return 压平空白后的文本，空单元格返回空串
      */
+    /**
+     * 列名清洗：空列名补成 {@code 列N}，重名追加 {@code #2}、{@code #3}。
+     *
+     * <p>为什么必须有这一步：单元格墙时代列名只是装饰，空着也不影响读；
+     * 换成键值渲染后列名就是键，空键会产出 {@code ": 14"} 这种没有语义的片段，
+     * 重名则让两个不同的值顶着同一个键。
+     *
+     * <p>重名的典型来源是**一个 sheet 里并排放了两张表**（实测某接口比对表左右各一组
+     * "序号/参数名称/参数说明/数据类型/是否必填"）。这类表本该拆成两块，但拆表要先识别
+     * 空列分界，属于另一个改动；当前先靠 {@code #2} 保证键唯一，至少不会张冠李戴。
+     *
+     * @param header 原表头（可能含空串与重复值）
+     * @param width  列数
+     * @return 长度等于 width、无空值、无重复的列名
+     */
+    private List<String> normalizeHeader(List<String> header, int width) {
+        List<String> out = new ArrayList<>(width);
+        Map<String, Integer> seen = new HashMap<>();
+        for (int c = 0; c < width; c++) {
+            String name = c < header.size() ? header.get(c) : "";
+            if (name.isEmpty()) {
+                name = "列" + (c + 1);
+            }
+            int n = seen.merge(name, 1, Integer::sum);
+            out.add(n == 1 ? name : name + "#" + n);
+        }
+        return out;
+    }
+
     private String cellText(Cell cell, DataFormatter fmt, int[] noCache) {
         if (cell == null) {
             return "";
