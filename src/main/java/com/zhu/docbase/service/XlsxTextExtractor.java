@@ -39,7 +39,11 @@ import java.util.regex.Pattern;
  *
  * <p><b>渲染格式</b>：保持「单元格墙」（每格一行）+ 顶部两行元信息。故意不做行级键值化
  * （那是阶段 2，前置条件未满足），也不做 Markdown 表格（实测更差：top-5 命中 6/8 vs 7/8）。
- * 与实验脚本 {@code 评测/测xlsx格式.py} 的 A2 臂保持一致，这样实验结论能直接对上生产。
+ * 与实验脚本 {@code 评测/测xlsx格式-RRF.py} 的 A2 臂保持一致，这样实验结论能直接对上生产。
+ *
+ * <p><b>唯一的例外是转置表</b>（字段名在行、记录在列）：这类表套单元格墙或行级键值都会散架，
+ * 所以先认出来，改走"一条记录一行"的键值渲染，见 {@link #renderTransposed}。
+ * 全库实测只有 1 张这样的表，判据刻意做窄，认不出来就退回单元格墙，不会比原来更差。
  *
  * <pre>
  * 【表】某表.xlsx｜sheet: 主机层面｜列: 问题编号、安全要求、安全层面、…
@@ -102,6 +106,35 @@ public class XlsxTextExtractor {
     private static final Pattern NUMERIC_LIKE = Pattern.compile("[\\d.\\-/:\\s]*");
 
     /**
+     * 转置表识别的扫描行数上限。
+     *
+     * <p>序号行只会出现在表头位置，比表头定位的 12 行更靠前，8 行足够。
+     */
+    private static final int TRANSPOSE_SCAN_ROWS = 8;
+
+    /** 序号行里至少要数出这么多条记录，才值得转置（少于 3 条没必要） */
+    private static final int TRANSPOSE_MIN_RECORDS = 3;
+
+    /** 序号行里"纯数字单元格"的最低占比。实测命中样本是 0.86（6 个数字 / 7 个非空） */
+    private static final double TRANSPOSE_NUM_RATIO = 0.5;
+
+    /** 第一列"字段名得分"的下限。低于它说明第一列是数据（如分类值），不是字段名 */
+    private static final double TRANSPOSE_FIELD_RATIO = 0.6;
+
+    /** 字段名的字数上限。与 {@link #HEADER_CELL_MAX_LEN} 同口径，超过的基本是说明文字 */
+    private static final int FIELD_NAME_MAX_LEN = 14;
+
+    /** 单条记录的字符数告警线。超过它就要担心切块时一条记录被拆到两个块里 */
+    private static final int TRANSPOSE_RECORD_WARN_LEN = 400;
+
+    /**
+     * 纯整数（序号）。带小数点的不算——序号列不会写成 {@code 1.0}。
+     *
+     * <p>长度上限 6 位：超过 6 位的多半是编码/日期，不是序号，参与递增判断会误判。
+     */
+    private static final Pattern PURE_INT = Pattern.compile("\\d+");
+
+    /**
      * 单元格内连续空白（含换行）压成一个空格。
      *
      * <p>必须显式带上 {@code \u00A0}（不间断空格）和 {@code \u3000}（全角空格）：
@@ -133,10 +166,17 @@ public class XlsxTextExtractor {
      * @param nonEmptyCells    实际渲染进正文的格子数
      * @param emptyCells       保留下来的格子里的空值数（含表头行以外的数据区）
      * @param formulaNoCache   公式单元格取不到缓存值的个数（需要 WARN）
+     * @param transposedSheets 判为转置表（字段名在行、记录在列）并改走转置渲染的 sheet 数
+     * @param transposedRecords 转置渲染输出的记录条数（空记录列不计）
+     *
+     * <p>注意：转置渲染的 sheet <b>不参与</b> {@code nonEmptyCells} / {@code emptyCells} 计数
+     * （那两个数只统计单元格墙路径）。{@code emptyRatio()} 本来就只作参考、不是验收项，
+     * 少一张表的格子不影响任何门槛判断。
      */
     public record Stats(int sheets, int dataRows, int cols, long mergedCells,
                         long mergedStillEmpty, long mergedEmptyAnchor,
-                        long nonEmptyCells, long emptyCells, int formulaNoCache) {
+                        long nonEmptyCells, long emptyCells, int formulaNoCache,
+                        int transposedSheets, int transposedRecords) {
 
         /** 合并导致的空值占比：分母是"本来会被合并吃掉的格子"，分子是回填后仍为空的 */
         public double mergedEmptyRatio() {
@@ -155,11 +195,12 @@ public class XlsxTextExtractor {
                     mergedCells + o.mergedCells, mergedStillEmpty + o.mergedStillEmpty,
                     mergedEmptyAnchor + o.mergedEmptyAnchor,
                     nonEmptyCells + o.nonEmptyCells, emptyCells + o.emptyCells,
-                    formulaNoCache + o.formulaNoCache);
+                    formulaNoCache + o.formulaNoCache,
+                    transposedSheets + o.transposedSheets, transposedRecords + o.transposedRecords);
         }
 
         public static Stats empty() {
-            return new Stats(0, 0, 0, 0, 0, 0, 0, 0, 0);
+            return new Stats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
     }
 
@@ -181,6 +222,7 @@ public class XlsxTextExtractor {
         DataFormatter fmt = new DataFormatter();
 
         int sheets = 0, dataRows = 0, cols = 0, formulaNoCache = 0;
+        int transposedSheets = 0, transposedRecords = 0;
         long mergedCells = 0, mergedStillEmpty = 0, mergedEmptyAnchor = 0;
         long nonEmptyCells = 0, emptyCells = 0;
 
@@ -316,6 +358,42 @@ public class XlsxTextExtractor {
                     maxWidth = usedCols.size();
                 }
 
+                // ---------- 4.5 转置表：字段名在行、记录在列 ----------
+                // 这类表拿"一行一记录"套上去，字段名会被当成第一列的数据，
+                // 值又挂在错位的键下面 —— 语义直接散掉。所以先认出来，改走"一条记录一行"的转置渲染。
+                //
+                // 判据故意做窄（序号行三条同时满足）：宁可漏判退回原来的单元格墙（不会更差），
+                // 也不要误判 —— 宽表被转置会把列名和值拆开。
+                int seqRow = findSeqRow(rows);
+                if (seqRow >= 0) {
+                    TransposedRender tr = renderTransposed(sb, file.getName(), sheet.getSheetName(), rows, seqRow);
+                    if (tr != null) {
+                        sheets++;
+                        // 数据行按**原表物理行数**计，不按记录条数计，与"没有表头"的老分支同口径。
+                        // 注意这会让本表的行数变化：老逻辑把第 3 行当成表头，只数了 11 行；
+                        // 现在序号行才是表头，上面是标题、下面是数据，共 14 行。
+                        // 全库因此 13,192 → 13,195（只此一张表，其余 38 个 sheet 不变）。
+                        dataRows += rows.size();
+                        cols += maxWidth;
+                        transposedSheets++;
+                        transposedRecords += tr.records();
+                        log.debug("转置渲染 {} / {}：{} 条记录、{} 个字段、跳过 {} 个空记录列",
+                                file.getName(), sheet.getSheetName(),
+                                tr.records(), tr.fields(), tr.emptyColumns());
+                        if (tr.maxLineLen() > TRANSPOSE_RECORD_WARN_LEN) {
+                            log.warn("{} / {} 有一条转置记录长达 {} 字，切块时可能被拆开",
+                                    file.getName(), sheet.getSheetName(), tr.maxLineLen());
+                        }
+                        sb.append('\n');
+                        continue;
+                    }
+                } else if (looksLikeFieldColumn(rows) && maxWidth > rows.size() * 2) {
+                    // 软信号：列远多于行、第一列又像字段名，但没找到序号行。
+                    // 不改变渲染，只留一条日志 —— 换语料后能一眼看出判据是不是该放宽。
+                    log.info("疑似转置但未达判据：{} / {}（{} 行 x {} 列）",
+                            file.getName(), sheet.getSheetName(), rows.size(), maxWidth);
+                }
+
                 // ---------- 5. 表头定位 + 多级表头拼接 ----------
                 int headerIdx = pickHeader(rows);
                 List<String> header;
@@ -389,22 +467,7 @@ public class XlsxTextExtractor {
                 // 按"表头之前都是标题"处理会把它整段丢掉 —— 字数比直接从 1.0 掉到 0.12。
                 // 所以表头之前的非空行统一按"前序"输出，一行一条，单元格用 | 分隔。
                 for (int r = 0; r < Math.min(headerIdx < 0 ? 0 : headerIdx, rows.size()); r++) {
-                    List<String> row = rows.get(r);
-                    // 横向合并回填后，一行里会出现几十个相同值（标题横跨 38 列就重复 38 遍），
-                    // 渲染时把**相邻重复**压掉，只留一次。注意只在"前序行"这么做：
-                    // 表头行不能压，多级表头拼接正是靠"有重复列名"来判定的。
-                    List<String> cells = new ArrayList<>();
-                    String prev = null;
-                    for (String cell : row) {
-                        if (cell.isEmpty() || cell.equals(prev)) {
-                            continue;
-                        }
-                        cells.add(cell);
-                        prev = cell;
-                    }
-                    if (!cells.isEmpty()) {
-                        sb.append("前序: ").append(String.join(" | ", cells)).append('\n');
-                    }
+                    appendPreamble(sb, rows.get(r));
                 }
 
                 // 表头行：单元格墙本身不带列名，没有这行模型无法把值对应到列
@@ -425,7 +488,8 @@ public class XlsxTextExtractor {
         }
 
         Stats stats = new Stats(sheets, dataRows, cols, mergedCells, mergedStillEmpty,
-                mergedEmptyAnchor, nonEmptyCells, emptyCells, formulaNoCache);
+                mergedEmptyAnchor, nonEmptyCells, emptyCells, formulaNoCache,
+                transposedSheets, transposedRecords);
         if (formulaNoCache > 0) {
             log.warn("{} 个公式单元格取不到缓存值（可能从未在 Excel 里保存过计算结果）: {}",
                     formulaNoCache, file.getName());
@@ -608,5 +672,249 @@ public class XlsxTextExtractor {
     private boolean isShortTextRow(List<String> row) {
         List<String> cells = row.stream().filter(s -> !s.isEmpty()).toList();
         return cells.size() >= 2 && cells.stream().allMatch(c -> c.length() <= SUBHEADER_CELL_MAX_LEN);
+    }
+
+    // ==================== 转置表（字段名在行、记录在列） ====================
+
+    /**
+     * 转置渲染的结果，只用于统计和告警。
+     *
+     * @param records     输出了几条记录
+     * @param fields      字段（键）的个数
+     * @param emptyColumns 有记录号但整列没有数据的记录列数（被跳过）
+     * @param maxLineLen  最长一条记录的字符数
+     */
+    private record TransposedRender(int records, int fields, int emptyColumns, int maxLineLen) {
+    }
+
+    /**
+     * 找"序号行"——转置表的标志。
+     *
+     * <p>为什么不做成"列数远多于行数"：那是宽表的常态。实测 40 个 sheet 里，按列数/行数比判定会
+     * 把两张普通宽表（6 行 17 列、6 行 39 列）也判成转置，假阳性 2/2；而按下面的序号行判定，
+     * 命中 1 张、误报 0。
+     *
+     * <p>四条同时满足才算：非空单元格 ≥ {@value #TRANSPOSE_MIN_RECORDS}、纯数字占比
+     * ≥ {@value #TRANSPOSE_NUM_RATIO}、数字严格递增、第一列像字段名。
+     * 数字递增是关键的一条——统计行（如「1 2 2 3」）过不了。
+     *
+     * @param rows 已回填、已裁列的网格
+     * @return 序号行的下标；不是转置表返回 -1
+     */
+    private int findSeqRow(List<List<String>> rows) {
+        if (!looksLikeFieldColumn(rows)) {
+            return -1;
+        }
+        int limit = Math.min(TRANSPOSE_SCAN_ROWS, rows.size());
+        for (int i = 0; i < limit; i++) {
+            int nonEmpty = 0;
+            List<Long> nums = new ArrayList<>();
+            for (String cell : rows.get(i)) {
+                if (cell.isEmpty()) {
+                    continue;
+                }
+                nonEmpty++;
+                if (isSeqNumber(cell)) {
+                    nums.add(Long.parseLong(cell));
+                }
+            }
+            if (nonEmpty == 0 || nums.size() < TRANSPOSE_MIN_RECORDS) {
+                continue;
+            }
+            if ((double) nums.size() / nonEmpty < TRANSPOSE_NUM_RATIO) {
+                continue;
+            }
+            boolean increasing = true;
+            for (int k = 1; k < nums.size(); k++) {
+                if (nums.get(k) <= nums.get(k - 1)) {
+                    increasing = false;
+                    break;
+                }
+            }
+            if (increasing) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 第一列是否像"字段名"：非空、不超 {@value #FIELD_NAME_MAX_LEN} 字、不是纯数字。
+     *
+     * <p>转置表的字段名在这一列，普通表这一列是数据（分类值、编号、备注），后者通常更短更杂。
+     * 分母只数非空格——空列不参与，否则稀疏表会被稀释成"不像"。
+     *
+     * @param rows 已回填、已裁列的网格
+     * @return 像字段名列返回 true
+     */
+    private boolean looksLikeFieldColumn(List<List<String>> rows) {
+        int total = 0, field = 0;
+        for (List<String> row : rows) {
+            String cell = row.get(0);
+            if (cell.isEmpty()) {
+                continue;
+            }
+            total++;
+            if (cell.length() <= FIELD_NAME_MAX_LEN && !PURE_INT.matcher(cell).matches()) {
+                field++;
+            }
+        }
+        return total > 0 && (double) field / total >= TRANSPOSE_FIELD_RATIO;
+    }
+
+    /** 是否是序号格：纯整数且不超过 6 位（更长的多半是编码/日期，参与递增判断会误判） */
+    private boolean isSeqNumber(String s) {
+        return s.length() <= 6 && PURE_INT.matcher(s).matches();
+    }
+
+    /**
+     * 把转置表渲染成"一条记录一行"的键值文本。
+     *
+     * <p>结构：序号行左边是标签列（字段名），右边每个数字列是一条记录。
+     * 标签列可能有 2 列（一级分组 + 二级字段，如「分成规则 / 省级」），用 {@code /} 拼接，
+     * 与多级表头的 {@code 父/子} 保持同一套写法。
+     *
+     * <p>三条必须跳过的：
+     * <ol>
+     *   <li>标签全空的行——没有键，值无处挂；</li>
+     *   <li>某条记录里空值的格——不输出 {@code 键: }；</li>
+     *   <li>除记录号外整列无数据的记录列——横向合并的标题会把空列"填满"，
+     *       导致裁空列失效，这类假记录必须在这里挡掉。</li>
+     * </ol>
+     *
+     * @param sb        正文缓冲
+     * @param fileName  文件名（写进元信息行）
+     * @param sheetName sheet 名
+     * @param rows      已回填、已裁列的网格
+     * @param seqRow    序号行下标
+     * @return 渲染结果；无法渲染（没有标签列 / 一条记录都没有）返回 null，由调用方退回普通渲染
+     */
+    private TransposedRender renderTransposed(StringBuilder sb, String fileName, String sheetName,
+                                              List<List<String>> rows, int seqRow) {
+        List<String> seq = rows.get(seqRow);
+        int firstNumCol = -1;
+        for (int c = 0; c < seq.size(); c++) {
+            if (isSeqNumber(seq.get(c))) {
+                firstNumCol = c;
+                break;
+            }
+        }
+        if (firstNumCol <= 0) {
+            return null;   // 左边没有标签列，转置出来也没有键
+        }
+
+        List<Integer> recCols = new ArrayList<>();
+        for (int c = firstNumCol; c < seq.size(); c++) {
+            if (isSeqNumber(seq.get(c))) {
+                recCols.add(c);
+            }
+        }
+
+        // 字段名：标签列非空值用 / 拼接。标签全空、或所有记录列都没值的行跳过
+        // （后者是"标准上限/标准下限"这类整行留空的占位字段，进字段清单只会添噪）。
+        List<Integer> labelRows = new ArrayList<>();
+        List<String> keys = new ArrayList<>();
+        for (int r = seqRow + 1; r < rows.size(); r++) {
+            String key = joinLabel(rows.get(r), firstNumCol);
+            if (key.isEmpty() || keys.contains(key)) {
+                continue;
+            }
+            boolean hasValue = false;
+            for (int c : recCols) {
+                if (!rows.get(r).get(c).isEmpty()) {
+                    hasValue = true;
+                    break;
+                }
+            }
+            if (!hasValue) {
+                continue;
+            }
+            labelRows.add(r);
+            keys.add(key);
+        }
+        if (keys.isEmpty()) {
+            return null;
+        }
+
+        List<String> lines = new ArrayList<>();
+        int emptyColumns = 0, maxLen = 0;
+        for (int c : recCols) {
+            String no = seq.get(c);
+            List<String> parts = new ArrayList<>();
+            parts.add("序号: " + no);
+            for (int i = 0; i < labelRows.size(); i++) {
+                String value = rows.get(labelRows.get(i)).get(c);
+                if (!value.isEmpty()) {
+                    parts.add(keys.get(i) + ": " + value);
+                }
+            }
+            if (parts.size() == 1) {
+                emptyColumns++;
+                continue;   // 只有记录号，整列没有数据
+            }
+            String line = String.join(" | ", parts);
+            lines.add(line);
+            maxLen = Math.max(maxLen, line.length());
+        }
+        if (lines.isEmpty()) {
+            return null;
+        }
+
+        sb.append("【表】").append(fileName)
+                .append("｜sheet: ").append(sheetName)
+                .append("｜转置: 是｜记录: ").append(lines.size())
+                .append("｜字段: ").append(String.join("、", keys))
+                .append('\n');
+        for (int r = 0; r < seqRow; r++) {
+            appendPreamble(sb, rows.get(r));
+        }
+        for (String line : lines) {
+            sb.append(line).append('\n');
+        }
+        return new TransposedRender(lines.size(), keys.size(), emptyColumns, maxLen);
+    }
+
+    /** 把一行里前 {@code labelCols} 列的非空值用 / 拼起来（转置表的字段名） */
+    private String joinLabel(List<String> row, int labelCols) {
+        StringBuilder b = new StringBuilder();
+        String prev = null;
+        for (int c = 0; c < labelCols && c < row.size(); c++) {
+            String v = row.get(c);
+            // 一级字段名横向合并（A:B）时，回填会让两列变成同一个值，这里不能重复拼
+            if (v.isEmpty() || v.equals(prev)) {
+                continue;
+            }
+            if (b.length() > 0) {
+                b.append('/');
+            }
+            b.append(v);
+            prev = v;
+        }
+        return b.toString();
+    }
+
+    /**
+     * 输出一行"前序"（表头之上的标题/说明）。
+     *
+     * <p>横向合并回填后，一行里会出现几十个相同值（标题横跨 38 列就重复 38 遍），
+     * 渲染时把<b>相邻重复</b>压掉，只留一次。只在"前序行"这么做：
+     * 表头行不能压，多级表头拼接正是靠"有重复列名"来判定的。
+     *
+     * @param sb  正文缓冲
+     * @param row 一行
+     */
+    private void appendPreamble(StringBuilder sb, List<String> row) {
+        List<String> cells = new ArrayList<>();
+        String prev = null;
+        for (String cell : row) {
+            if (cell.isEmpty() || cell.equals(prev)) {
+                continue;
+            }
+            cells.add(cell);
+            prev = cell;
+        }
+        if (!cells.isEmpty()) {
+            sb.append("前序: ").append(String.join(" | ", cells)).append('\n');
+        }
     }
 }

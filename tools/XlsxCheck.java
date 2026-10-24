@@ -140,6 +140,10 @@ public class XlsxCheck {
         System.out.printf("有数据的合并区域覆盖 %d 格（不含锚点）｜回填后仍为空 %d 格%n",
                 sum.mergedCells(), sum.mergedStillEmpty());
         System.out.printf("锚点本身为空的合并格 %d 个（版面留白，不参与验收）%n", sum.mergedEmptyAnchor());
+        if (sum.transposedSheets() > 0) {
+            System.out.printf("转置表 %d 个 sheet｜输出记录 %d 条（已改走一条记录一行的键值渲染）%n",
+                    sum.transposedSheets(), sum.transposedRecords());
+        }
         double ratio = sum.mergedEmptyRatio();
         System.out.printf("★ 硬验收：合并导致的空值占比 = %.3f%%  →  %s（门槛 < 1%%）%n",
                 ratio * 100, ratio < 0.01 ? "PASS" : "FAIL");

@@ -179,8 +179,7 @@ class XlsxTextExtractorTest {
 
     @Test
     @DisplayName("公式单元格不会把公式文本当正文")
-    void formulaUsesCachedValue(@TempDir Path dir) throws Exception {
-        // 说明：POI 写出的公式**自带一个 0.0 的缓存结果**，所以这里测不到"缓存缺失"的分支，
+    void formulaUsesCachedValue(@TempDir Path dir) throws Exception {        // 说明：POI 写出的公式**自带一个 0.0 的缓存结果**，所以这里测不到"缓存缺失"的分支，
         // 只验证最关键的一条：公式文本（A2*2）不能出现在正文里。
         // 真实缓存值的读取靠 tools/XlsxCheck.java 在语料上验收（那批文件是 Excel 存的，带真缓存值）。
         Path file = dir.resolve("公式样例.xlsx");
@@ -200,5 +199,123 @@ class XlsxTextExtractorTest {
         XlsxTextExtractor.Result r = new XlsxTextExtractor().extract(file.toFile());
         assertFalse(r.text().contains("A2*2"), "公式文本被当成正文输出了：" + r.text());
         assertFalse(r.text().contains("*2"), "公式文本被当成正文输出了：" + r.text());
+    }
+
+    // ==================== 转置表（字段名在行、记录在列） ====================
+
+    /**
+     * 造一张转置表：左边两列是字段名（一级 + 二级），右边每个数字列是一条记录。
+     *
+     * <p>刻意放齐三种情况：
+     * <ol>
+     *   <li>标题横向合并（回填后每列都"非空"，所以裁空列裁不掉空记录列）；</li>
+     *   <li>一级字段名纵向合并（续行没有值，回填后才有）；</li>
+     *   <li>第 4 条记录只有记录号、整列没有数据 —— 必须被跳过。</li>
+     * </ol>
+     *
+     * @param dir 临时目录
+     * @return 生成的文件路径
+     */
+    private Path buildTransposed(Path dir) throws Exception {
+        Path file = dir.resolve("转置样例.xlsx");
+        try (Workbook wb = new XSSFWorkbook(); OutputStream out = Files.newOutputStream(file)) {
+            Sheet sh = wb.createSheet("填写表");
+
+            Row r0 = sh.createRow(0);
+            r0.createCell(0).setCellValue("示例填报说明表");
+            sh.addMergedRegion(new CellRangeAddress(0, 0, 0, 5));
+
+            Row r1 = sh.createRow(1);
+            r1.createCell(0).setCellValue("序号");
+            for (int i = 0; i < 4; i++) {
+                r1.createCell(2 + i).setCellValue(i + 1);
+            }
+
+            Row r2 = sh.createRow(2);
+            r2.createCell(0).setCellValue("字段甲");
+            r2.createCell(1).setCellValue("子项一");
+            r2.createCell(2).setCellValue("值甲一");
+            r2.createCell(3).setCellValue("值甲二");
+            r2.createCell(4).setCellValue("值甲三");
+            sh.addMergedRegion(new CellRangeAddress(2, 3, 0, 0));
+
+            Row r3 = sh.createRow(3);
+            r3.createCell(1).setCellValue("子项二");
+            r3.createCell(2).setCellValue("值乙一");
+            r3.createCell(3).setCellValue("值乙二");
+            r3.createCell(4).setCellValue("值乙三");
+
+            Row r4 = sh.createRow(4);
+            r4.createCell(0).setCellValue("字段乙");
+            r4.createCell(2).setCellValue("值丙一");
+            r4.createCell(3).setCellValue("值丙二");
+            r4.createCell(4).setCellValue("值丙三");
+
+            wb.write(out);
+        }
+        return file;
+    }
+
+    @Test
+    @DisplayName("转置表被认出来，并按一条记录一行渲染")
+    void transposedTableIsRenderedPerRecord(@TempDir Path dir) throws Exception {
+        XlsxTextExtractor.Result r = new XlsxTextExtractor().extract(buildTransposed(dir).toFile());
+        String text = r.text();
+
+        assertTrue(text.contains("转置: 是"), "没有识别成转置表，实际正文：\n" + text);
+        // 字段名在行上，两列标签要拼起来，否则「子项一」和「子项二」分不清
+        assertTrue(text.contains("字段甲/子项一: 值甲一"),
+                "字段名没有和值成对出现，实际正文：\n" + text);
+        assertTrue(text.contains("字段乙: 值丙三"), "第二个一级字段没渲染出来：\n" + text);
+        // 一条记录必须只占一行
+        assertEquals(3, text.lines().filter(l -> l.startsWith("序号: ")).count(),
+                "记录条数不对，实际正文：\n" + text);
+        assertTrue(text.contains("前序: 示例填报说明表"), "标题行被丢了：\n" + text);
+        assertEquals(1, r.stats().transposedSheets(), "转置 sheet 计数不对");
+        assertEquals(3, r.stats().transposedRecords(), "转置记录计数不对");
+    }
+
+    @Test
+    @DisplayName("只有记录号、整列无数据的记录列被跳过")
+    void emptyRecordColumnIsSkipped(@TempDir Path dir) throws Exception {
+        XlsxTextExtractor.Result r = new XlsxTextExtractor().extract(buildTransposed(dir).toFile());
+        // 第 4 条记录只有序号 4，横向合并的标题把这一列撑成"非空"，裁空列裁不掉，只能在渲染时挡掉
+        assertFalse(r.text().contains("序号: 4"), "空记录列没有被跳过：\n" + r.text());
+    }
+
+    @Test
+    @DisplayName("普通宽表不会被误判成转置表")
+    void wideTableIsNotTransposed(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("宽表样例.xlsx");
+        try (Workbook wb = new XSSFWorkbook(); OutputStream out = Files.newOutputStream(file)) {
+            Sheet sh = wb.createSheet("Sheet1");
+            Row h = sh.createRow(0);
+            String[] cols = {"资源分类", "资源名称", "资源代码", "提供方", "提供方代码",
+                    "资源摘要", "资源格式", "信息项名称", "数据类型", "共享类型",
+                    "共享条件", "共享方式", "开放条件", "更新周期", "发布日期", "关联代码", "备注"};
+            for (int c = 0; c < cols.length; c++) {
+                h.createCell(c).setCellValue(cols[c]);
+            }
+            // 数据行：首列是短文本分类值（会被回填成重复值），列数远多于行数
+            for (int i = 1; i <= 5; i++) {
+                Row r = sh.createRow(i);
+                r.createCell(0).setCellValue("主题资源");
+                r.createCell(1).setCellValue("业务报文" + i);
+                r.createCell(2).setCellValue("A0" + i);
+                r.createCell(3).setCellValue("某单位");
+                r.createCell(5).setCellValue("业务流水号、单位编码、单位名称等字段的说明文字");
+                r.createCell(6).setCellValue("接口");
+                r.createCell(7).setCellValue("信息项" + i);
+                r.createCell(8).setCellValue("String");
+                r.createCell(9).setCellValue("有条件共享");
+                r.createCell(10).setCellValue("依申请共享");
+                r.createCell(12).setCellValue("无");
+                r.createCell(13).setCellValue("实时");
+            }
+            wb.write(out);
+        }
+        XlsxTextExtractor.Result r = new XlsxTextExtractor().extract(file.toFile());
+        assertEquals(0, r.stats().transposedSheets(), "宽表被误判成转置表了：\n" + r.text());
+        assertTrue(r.text().contains("表头: "), "宽表没有走原来的单元格墙渲染：\n" + r.text());
     }
 }
