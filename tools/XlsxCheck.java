@@ -26,7 +26,7 @@ import java.util.stream.Stream;
  * <pre>
  * CP="target/classes;$(cat cp.txt)"
  * java -cp "$CP" tools/XlsxCheck.java <语料目录>
- * java -cp "$CP" tools/XlsxCheck.java <语料目录> --dump 网络策略表
+ * java -cp "$CP" tools/XlsxCheck.java <语料目录> --dump <文件名片段>
  * </pre>
  */
 public class XlsxCheck {

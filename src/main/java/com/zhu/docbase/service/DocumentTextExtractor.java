@@ -197,7 +197,7 @@ public class DocumentTextExtractor {
      *   <li><b>合并单元格</b>：横向合并（gridSpan=2）会补空列，保证每行列数一致，
      *       否则表格看着是歪的；纵向合并（vMerge=continue）输出空串，避免同一内容重复 N 遍。</li>
      *   <li><b>目录</b>：POI 的 getBodyElements() 拿不到 TOC 域的内容（TOC 在 w:sdt 里），
-     *       所以不需要再正则清理——这一点在 交接文档.docx 上实测过（Tika 9952 字符 vs POI 9060 字符，
+     *       所以不需要再正则清理——这一点在一份带目录的样本上实测过（Tika 9952 字符 vs POI 9060 字符，
      *       差的 892 字符正好是那 48 行目录）。</li>
      * </ul>
      *
