@@ -18,6 +18,8 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -144,6 +146,39 @@ public class XlsxTextExtractor {
      * 所以这条分支是兜底，不是主路径。
      */
     private static final int RECORD_SOFT_LIMIT = 700;
+
+    /** 列取值摘要：只收"取值数不多、值又短"的列，这类列才是"有哪些 X"问题的答案所在 */
+    private static final int SUMMARY_MIN_DISTINCT = 2;
+
+    /** 超过这么多不同取值就不全量列举了，改走"出现最多的 N 个"（见 SUMMARY_TOPN） */
+    private static final int SUMMARY_MAX_DISTINCT = 20;
+
+    /** 平均长度超过这个数，多半是描述性字段，摘出来只是噪音 */
+    private static final int SUMMARY_MAX_AVG_LEN = 20;
+
+    /** 单个值超过这么长就不当类别值（描述、整段说明、合并单元格的页脚都靠这条挡掉） */
+    private static final int SUMMARY_MAX_VALUE_LEN = 24;
+
+    /** 高基数列只列出现最多的前 N 个 */
+    private static final int SUMMARY_TOPN = 10;
+
+    /** 高基数列至少要有这么多非空值，样本太少谈"最多"没意义 */
+    private static final int SUMMARY_TOPN_MIN_ROWS = 30;
+
+    /** 前 N 个合计占不到这个比例，说明取值太散（编号、IP），不值得摘 */
+    private static final double SUMMARY_TOPN_MIN_COVER = 0.35;
+
+    /** 单个 sheet 最多摘几列，防止宽表把第一块撑爆 */
+    private static final int SUMMARY_MAX_COLUMNS = 6;
+
+    /** 单个 sheet 的摘要总字数上限（摘要和【表】行同在块 0，块只有约 800 字预算） */
+    private static final int SUMMARY_MAX_CHARS = 600;
+
+    /** 渲染器给没有表头的列起的占位名（列7、列8…），摘它们没有意义 */
+    private static final Pattern PLACEHOLDER_COL = Pattern.compile("列\\d+");
+
+    /** 序号/编号/流水号这类列，取值再多也不是"类别" */
+    private static final Pattern ID_COL = Pattern.compile(".*(序号|编号|流水号|ID|id)");
 
     /**
      * 纯整数（序号）。带小数点的不算——序号列不会写成 {@code 1.0}。
@@ -485,6 +520,17 @@ public class XlsxTextExtractor {
                         .append("｜列: ").append(String.join("、", header.stream().filter(h -> !h.isEmpty()).toList()))
                         .append('\n');
 
+                // 列取值摘要：回答"这一列有哪些取值"这类问题。
+                //
+                // 起因：有一类问题问的是某列的取值集合（"申请了哪几类资源""还有哪些人员类型"
+                // "哪两个区域互访"）。答案分散在几十条记录里，而检索只取 top-5 块，
+                // 实测这类题的 gold 常常落在第 8~20 名，靠调 topK 也救不回来
+                // （top-10 会让单题上下文从 3 千涨到 7 千 token，还会稀释其他题）。
+                //
+                // 放在这里而不是末尾：紧跟【表】行，保证它落在该 sheet 的第一块里，
+                // 和表名/列名同块，问"这张表有哪些 X"时能一起被召回。
+                appendColumnValueSummary(sb, file.getName(), sheet.getSheetName(), header, body, maxWidth);
+
                 // 【2026-10-23 修】表头之上的行不能直接丢。
                 // 实测踩到的坑：某张申请表第 2 行（第 39 列）塞着一段 4,162 字的 JSON 配置
                 // （字段定义 key/name/required），它在表头之上，
@@ -639,6 +685,122 @@ public class XlsxTextExtractor {
             case BOOLEAN -> String.valueOf(cell.getBooleanCellValue());
             default -> "";      // ERROR / BLANK：没有可用的缓存值
         };
+    }
+
+    /**
+     * 列取值摘要：把"类别列"的取值集合写成几行，跟【表】行放在同一块里。
+     *
+     * <p>两种写法，按列的基数自动选：
+     * <ol>
+     *   <li><b>低基数列</b>（不同取值 2~20 个）：全量列举 —— 回答"有哪些 X"</li>
+     *   <li><b>高基数列</b>（取值多但有明显头部）：列出现最多的前 10 个 —— 回答"最多的几件事"</li>
+     * </ol>
+     *
+     * <p>为什么要第二种：实测某工作记录表"事项"列有 <b>370 种</b>取值（1,182 次），
+     * 前 5 个占 61%。全量列举根本写不下，但"最多的三件事"正是那道题要的答案。
+     *
+     * <p>挡噪音的四道闸：单值超过 {@value #SUMMARY_MAX_VALUE_LEN} 字的不算类别值
+     * （描述、整段说明、合并单元格的页脚都靠这条）、纯数字列跳过（序号/金额）、
+     * 几乎每行都不同的列跳过（编号/IP）、每 sheet 最多 {@value #SUMMARY_MAX_COLUMNS} 列
+     * 且总字数不超过 {@value #SUMMARY_MAX_CHARS}。
+     *
+     * <p>只对普通表格做；转置表（字段名在行、记录在列）走自己的渲染，这里跳过。
+     */
+    private void appendColumnValueSummary(StringBuilder sb, String fileName, String sheetName,
+                                          List<String> header, List<List<String>> body, int maxWidth) {
+        List<String> lines = new ArrayList<>();
+        int used = 0;
+        for (int c = 0; c < maxWidth && lines.size() < SUMMARY_MAX_COLUMNS; c++) {
+            String col = header.get(c);
+            if (col.isEmpty() || PLACEHOLDER_COL.matcher(col).matches() || ID_COL.matcher(col).matches()) {
+                continue;
+            }
+            Map<String, Integer> freq = new LinkedHashMap<>();
+            int nonEmpty = 0;
+            int numeric = 0;
+            long totalLen = 0;
+            for (List<String> row : body) {
+                String cell = c < row.size() ? row.get(c) : "";
+                if (cell.isEmpty() || cell.length() > SUMMARY_MAX_VALUE_LEN) {
+                    continue;
+                }
+                nonEmpty++;
+                totalLen += cell.length();
+                if (isNumericCell(cell)) {
+                    numeric++;
+                }
+                freq.merge(cell, 1, Integer::sum);
+            }
+            // 以数字为主的列（序号、金额、端口）不是"取值集合"类问题要的答案
+            if (nonEmpty == 0 || numeric > nonEmpty * 0.8) {
+                continue;
+            }
+
+            String line;
+            if (freq.size() <= SUMMARY_MAX_DISTINCT) {
+                if (freq.size() < SUMMARY_MIN_DISTINCT) {
+                    continue;
+                }
+                if ((double) totalLen / nonEmpty > SUMMARY_MAX_AVG_LEN) {
+                    continue;
+                }
+                // 几乎每行都不一样的列（编号、流水号）不是类别列；表很小的时候不这么判
+                if (nonEmpty > 8 && freq.size() > nonEmpty * 0.9) {
+                    continue;
+                }
+                StringBuilder b = new StringBuilder(col).append(": ");
+                int shown = 0;
+                for (String v : freq.keySet()) {
+                    if (shown++ > 0) {
+                        b.append('、');
+                    }
+                    b.append(v);
+                }
+                line = b.append("（共 ").append(freq.size()).append(" 种）").toString();
+            } else {
+                if (nonEmpty < SUMMARY_TOPN_MIN_ROWS) {
+                    continue;
+                }
+                List<Map.Entry<String, Integer>> top = freq.entrySet().stream()
+                        .sorted((x, y) -> y.getValue() - x.getValue())
+                        .limit(SUMMARY_TOPN)
+                        .toList();
+                int covered = top.stream().mapToInt(Map.Entry::getValue).sum();
+                if ((double) covered / nonEmpty < SUMMARY_TOPN_MIN_COVER) {
+                    continue;
+                }
+                StringBuilder b = new StringBuilder(col).append("（出现最多）: ");
+                for (int i = 0; i < top.size(); i++) {
+                    if (i > 0) {
+                        b.append('、');
+                    }
+                    b.append(top.get(i).getKey()).append('×').append(top.get(i).getValue());
+                }
+                line = b.append("（共 ").append(freq.size()).append(" 种）").toString();
+            }
+
+            if (used + line.length() > SUMMARY_MAX_CHARS) {
+                break;
+            }
+            used += line.length();
+            lines.add(line);
+        }
+        if (lines.isEmpty()) {
+            return;
+        }
+        sb.append("【列取值】").append(fileName).append("｜sheet: ").append(sheetName).append('\n');
+        for (String line : lines) {
+            sb.append(line).append('\n');
+        }
+    }
+
+    /** 纯数字（含千分位、百分号、正负号）。序号/金额列靠这条挡掉 */
+    private boolean isNumericCell(String v) {
+        String s = v.replace(",", "").replace("%", "").trim();
+        if (s.isEmpty()) {
+            return false;
+        }
+        return s.matches("[-+]?\\d+(\\.\\d+)?");
     }
 
     /**
