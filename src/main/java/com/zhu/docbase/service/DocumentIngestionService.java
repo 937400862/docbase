@@ -632,6 +632,11 @@ public class DocumentIngestionService {
                     //   - 作用：避免产生"太短而无意义"的碎片块（比如单独一行标题、页码）。
                     //   - 调优建议：对于中文文档，350 是较合理的默认值；对于代码文件可以调低到 100-200。
                     .withMinChunkSizeChars(minChunkSizeChars)
+                    // 切点字符表：默认 `.` `?` `!` `\n` 里取位置最靠后的那个。
+                    // 表格正文里全是 IP / 金额 / 日期 / 版本号，最后一个 `.` 常落在数字中间，
+                    // 一条记录就被腰斩，续块开头没有键名（实测 3,591 块里 1,724 块如此）。
+                    // 所以表格只认换行：一行就是一条记录，切在行尾才是安全边界。
+                    .withPunctuationMarks(punctuationFor(fileName))
                     // 以下为可选参数，默认值已能满足大多数场景，按需启用：
 
                     // .withMinChunkLengthToEmbed(5)：短于该长度（字符数）的块直接丢弃。
@@ -1005,6 +1010,24 @@ public class DocumentIngestionService {
 
             // 默认：保守值
             default -> new int[]{400, 100};
+        };
+    }
+
+    /**
+     * 切点字符表。切块器在窗口填满后会回退到这些字符里**位置最靠后**的那个处切断。
+     *
+     * <p>默认的 `.` `?` `!` `\n` 对叙述性文档是对的，但表格渲染出来的正文里
+     * 全是 IP、金额、日期、版本号，最后一个 `.` 几乎总在数字中间 —— 于是切点落在记录中间，
+     * 续块开头是半条记录、键名丢了。实测 3,591 个 xlsx 块里 1,724 块（48%）如此。
+     *
+     * <p>表格里一行就是一条记录，所以只把换行当切点。代价是块装不满：
+     * 一条记录必须整条进块，36 个文件实测块数 3,591 → 4,316（+20.2%）。
+     */
+    private List<Character> punctuationFor(String fileName) {
+        String ext = getExtension(fileName).toLowerCase();
+        return switch (ext) {
+            case "xlsx", "xls" -> List.of('\n');
+            default -> List.of('.', '?', '!', '\n');
         };
     }
 
