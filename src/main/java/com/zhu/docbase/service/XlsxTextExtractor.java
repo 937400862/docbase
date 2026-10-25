@@ -198,10 +198,12 @@ public class XlsxTextExtractor {
     /**
      * 抽取结果。
      *
-     * @param text  渲染后的正文（未脱敏、未切分）
-     * @param stats 统计口径，用于验收「合并导致的空值占比 &lt; 1%」
+     * @param text       渲染后的正文（未脱敏、未切分）
+     * @param sideChunks 需要单独成块的派生文本（列取值摘要），一段一个 sheet；
+     *                   它们不并进 {@code text}，否则会被切块器揉进第一块、向量被稀释
+     * @param stats      统计口径，用于验收「合并导致的空值占比 &lt; 1%」
      */
-    public record Result(String text, Stats stats) {
+    public record Result(String text, List<String> sideChunks, Stats stats) {
     }
 
     /**
@@ -268,6 +270,8 @@ public class XlsxTextExtractor {
      */
     public Result extract(File file) throws Exception {
         StringBuilder sb = new StringBuilder(64 * 1024);
+        // 列取值摘要不进 sb：它要单独成块（并进正文会被切块器揉进第一块，向量被稀释）
+        List<String> sideChunks = new ArrayList<>();
         // DataFormatter 不带 evaluator：公式单元格直接取文件里存的**缓存值**，
         // 不重新计算。理由是重算要跑整个依赖图，慢且可能抛异常；
         // 而 Excel/WPS 保存时一定写过缓存值，取它才是"用户当时看到的结果"。
@@ -521,14 +525,19 @@ public class XlsxTextExtractor {
 
                 // 列取值摘要：回答"这一列有哪些取值"这类问题。
                 //
-                // 起因：有一类问题问的是某列的取值集合（"这张表分哪几类""还有哪些类型"）
+                // 起因：有一类问题问的是某列的取值集合（"这张表分哪几类""还有哪些类型"、
                 // "哪两个对象之间有关联"）。答案分散在几十条记录里，而检索只取 top-5 块，
                 // 实测这类题的 gold 常常落在第 8~20 名，靠调 topK 也救不回来
                 // （top-10 会让单题上下文从 3 千涨到 7 千 token，还会稀释其他题）。
                 //
-                // 放在这里而不是末尾：紧跟【表】行，保证它落在该 sheet 的第一块里，
-                // 和表名/列名同块，问"这张表有哪些 X"时能一起被召回。
-                appendColumnValueSummary(sb, file.getName(), sheet.getSheetName(), header, body, maxWidth);
+                // 单独成块，不并进正文：第一版是紧跟【表】行输出，结果它和表头、前几条记录
+                // 挤在同一块里，向量被稀释 —— 实测同一批题里，摘要块能排第 2 的就答对，
+                // 排不进 top-5 的仍然答不出。摘要本身是"整列的取值集合"，语义很纯，
+                // 单独一块才能被准确召回。
+                String summary = columnValueSummary(file.getName(), sheet.getSheetName(), header, body, maxWidth);
+                if (!summary.isEmpty()) {
+                    sideChunks.add(summary);
+                }
 
                 // 【2026-10-23 修】表头之上的行不能直接丢。
                 // 实测踩到的坑：某张申请表第 2 行（第 39 列）塞着一段 4,162 字的 JSON 配置
@@ -583,7 +592,7 @@ public class XlsxTextExtractor {
             log.warn("{} 个公式单元格取不到缓存值（可能从未在 Excel 里保存过计算结果）: {}",
                     formulaNoCache, file.getName());
         }
-        return new Result(sb.toString(), stats);
+        return new Result(sb.toString(), sideChunks, stats);
     }
 
     /**
@@ -704,9 +713,12 @@ public class XlsxTextExtractor {
      * 且总字数不超过 {@value #SUMMARY_MAX_CHARS}。
      *
      * <p>只对普通表格做；转置表（字段名在行、记录在列）走自己的渲染，这里跳过。
+     *
+     * @return 该 sheet 的摘要文本（自带 {@code 【列取值】文件名｜sheet: 名} 头，可独立成块）；
+     *         没有可摘的列时返回空串
      */
-    private void appendColumnValueSummary(StringBuilder sb, String fileName, String sheetName,
-                                          List<String> header, List<List<String>> body, int maxWidth) {
+    private String columnValueSummary(String fileName, String sheetName,
+                                      List<String> header, List<List<String>> body, int maxWidth) {
         List<String> lines = new ArrayList<>();
         int used = 0;
         for (int c = 0; c < maxWidth && lines.size() < SUMMARY_MAX_COLUMNS; c++) {
@@ -785,12 +797,14 @@ public class XlsxTextExtractor {
             lines.add(line);
         }
         if (lines.isEmpty()) {
-            return;
+            return "";
         }
-        sb.append("【列取值】").append(fileName).append("｜sheet: ").append(sheetName).append('\n');
+        StringBuilder out = new StringBuilder();
+        out.append("【列取值】").append(fileName).append("｜sheet: ").append(sheetName).append('\n');
         for (String line : lines) {
-            sb.append(line).append('\n');
+            out.append(line).append('\n');
         }
+        return out.toString();
     }
 
     /** 纯数字（含千分位、百分号、正负号）。序号/金额列靠这条挡掉 */

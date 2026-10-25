@@ -22,6 +22,7 @@ import java.nio.charset.Charset;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
@@ -126,6 +127,22 @@ public class DocumentTextExtractor {
      * @throws Exception 读取过程中的 IO / 解析异常（由调用方 catch Throwable 兜底）
      */
     public String extract(File file) throws Exception {
+        return String.join("\n", extractParts(file));
+    }
+
+    /**
+     * 抽取，但把"必须各自成块"的派生文本单独拆出来。
+     *
+     * <p>目前只有表格有这种东西：每个 sheet 的列取值摘要（{@code 【列取值】…}）。
+     * 它并进正文的话会被切块器揉进第一块，和表头、前几条记录抢位置，向量被稀释；
+     * 拆出来之后调用方可以逐段切分，让它自己占一块。
+     *
+     * <p>其余类型永远只有一段。
+     *
+     * @param file 待抽取的文件
+     * @return 若干段文本，第一段是正文；抽不出内容时返回空列表
+     */
+    public List<String> extractParts(File file) throws Exception {
         String name = file.getName();
         String ext = extensionOf(name).toLowerCase();
 
@@ -142,13 +159,13 @@ public class DocumentTextExtractor {
                 log.warn("POI 解析 docx 失败（{}），退回 Tika 兜底: {}", t.toString(), name);
             }
             if (text != null && text.strip().length() >= POI_MIN_CHARS) {
-                return text;
+                return List.of(text);
             }
             // POI 读不出东西（加密、损坏、内容全在 sdt/文本框里），同样退回 Tika
             if (text != null) {
                 log.warn("POI 抽取内容过少（{} 字符），退回 Tika 兜底: {}", text.strip().length(), name);
             }
-            return readWithTika(file);
+            return List.of(readWithTika(file));
         }
 
         // ---------- 路线 2：xlsx / xls → POI 结构化抽取（表头定位 + 合并回填 + 元信息行） ----------
@@ -162,22 +179,25 @@ public class DocumentTextExtractor {
                 log.warn("POI 解析 xlsx 失败（{}），退回 Tika 兜底: {}", t.toString(), name);
             }
             if (result != null && result.text().strip().length() >= POI_MIN_CHARS) {
-                return result.text();
+                List<String> parts = new ArrayList<>();
+                parts.add(result.text());
+                parts.addAll(result.sideChunks());
+                return parts;
             }
             if (result != null) {
                 log.warn("POI 抽取 xlsx 内容过少（{} 字符，{} 个有效 sheet），退回 Tika 兜底: {}",
                         result.text().strip().length(), result.stats().sheets(), name);
             }
-            return readWithTika(file);
+            return List.of(readWithTika(file));
         }
 
         // ---------- 路线 3：纯文本 → 自己解码，UTF-8 失败按 GB18030 兜底 ----------
         if (PLAIN_TEXT_EXTS.contains(ext)) {
-            return readPlainText(file);
+            return List.of(readPlainText(file));
         }
 
         // ---------- 路线 4：其余二进制格式 → Tika（大栈线程） ----------
-        return readWithTika(file);
+        return List.of(readWithTika(file));
     }
 
     // ==================== 路线 1：docx 用 POI 还原表格 ====================

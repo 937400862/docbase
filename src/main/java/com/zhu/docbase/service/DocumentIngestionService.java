@@ -585,30 +585,37 @@ public class DocumentIngestionService {
             //      - .doc/.pdf/.xls…  → 仍然走 Tika，且跑在 8MB 栈的独立线程里
             //                            （2026-10-19 实测：POI/HWPF 解析老式 .doc 时正则递归过深，
             //                             默认 1MB 栈直接 StackOverflowError，4MB 通过、8MB 稳）
-            String rawText = textExtractor.extract(new File(filePath));
+            // 抽取结果是"若干段"而不是一整串：表格的列取值摘要要单独成块（见步骤 6）。
+            // 其余类型永远只有一段，行为和以前一样。
+            List<String> parts = textExtractor.extractParts(new File(filePath));
 
             // 3. 【改动】清掉目录（TOC）噪音
             //    Tika 会把渲染后的目录条目（"1.1. 标题\t3"）当正文输出。目录行包含全文档所有章节标题，
             //    向量化后对"这文档讲了什么"这类查询相似度极高，是"高相似度、零信息量"的强干扰。
             //    只在"文档类"上做，代码/配置文件里不会有这种形态，没必要多跑一遍正则。
-            if (isDocumentType(fileName)) {
-                rawText = DocumentTextExtractor.stripTocNoise(rawText);
+            List<String> cleaned = new ArrayList<>(parts.size());
+            for (String part : parts) {
+                String text = isDocumentType(fileName) ? DocumentTextExtractor.stripTocNoise(part) : part;
+                if (text != null && !text.isBlank()) {
+                    cleaned.add(text);
+                }
             }
 
             // 4. 【改动】内容过短直接跳过（不算失败）
             //    实测 bcmap/rpm/~$ 锁文件等 1704 个文件只能抽出 0~1 个字符，
             //    以前会走完切分得到 0 片段并被记成"摄入失败"。
-            if (rawText == null || rawText.strip().length() < MIN_TEXT_CHARS) {
-                log.warn("跳过: 解析出内容过短（{} 字符）",
-                        rawText == null ? 0 : rawText.strip().length());
+            int totalChars = cleaned.stream().mapToInt(String::length).sum();
+            if (totalChars < MIN_TEXT_CHARS) {
+                log.warn("跳过: 解析出内容过短（{} 字符）", totalChars);
                 return IngestResult.skipShort();
             }
 
             // 5. 组装成 Spring AI 的 Document
             //    metadata 里的 source 保持与原来 Tika 的行为一致（文件名），便于后续排查来源
-            List<Document> documents = List.of(
-                    new Document(rawText, Map.of("source", fileName))
-            );
+            List<Document> documents = new ArrayList<>(cleaned.size());
+            for (String text : cleaned) {
+                documents.add(new Document(text, Map.of("source", fileName)));
+            }
 
             // 6. 文本切分：按 Token 数切分，默认 chunk 800 token，overlap 100 token
             // overlap 确保句子不会被粗暴切断[reference:6]
@@ -648,7 +655,11 @@ public class DocumentIngestionService {
                     .build();
             // apply() 是 Transformer 接口的核心方法，对传入的文档列表执行切分。
             // 返回的 List<Document> 中，每个元素都是原始文档的一个片段。
-            List<Document> splitDocuments = splitter.apply(documents);
+            // 逐段切：段与段之间不共享窗口，所以列取值摘要不会被并进前一块
+            List<Document> splitDocuments = new ArrayList<>();
+            for (Document doc : documents) {
+                splitDocuments.addAll(splitter.apply(List.of(doc)));
+            }
 
             // 7. 正则脱敏（针对每个切分后的小块执行）
             List<Document> regexSanitized = splitDocuments.stream()
