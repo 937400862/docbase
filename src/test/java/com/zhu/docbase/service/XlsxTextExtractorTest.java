@@ -113,8 +113,10 @@ class XlsxTextExtractorTest {
     @DisplayName("纵向合并的分类字段被回填到下一行")
     void verticalMergeIsBackfilled(@TempDir Path dir) throws Exception {
         XlsxTextExtractor.Result r = new XlsxTextExtractor().extract(buildSample(dir).toFile());
-        // 「业务功能升级改造」只在第 1 行有值，回填后第 2 行也应该带上
-        long count = r.text().lines().filter(l -> l.equals("分组一")).count();
+        // 「分组一」只在第 1 行有值，回填后第 2 行也应该带上。
+        // 记录是行级键值（`序号: 分组一 | …`），所以按"行里含这个字段值"来数，
+        // 不能按整行等于它来数 —— 那是单元格墙时代的形态。
+        long count = r.text().lines().filter(l -> l.contains("序号: 分组一")).count();
         assertEquals(2, count, "纵向合并只回填了 1 行，实际正文：\n" + r.text());
     }
 
@@ -163,8 +165,8 @@ class XlsxTextExtractorTest {
         XlsxTextExtractor.Result r = new XlsxTextExtractor().extract(file.toFile());
         assertTrue(r.text().contains("10.0.0.1 10.0.0.11 10.0.0.21"),
                 "单元格内换行没压平，一行一记录会被拆散，实际正文：\n" + r.text());
-        // 一条记录只能占一行
-        long lines = r.text().lines().filter(l -> l.startsWith("10.0.0.1 ")).count();
+        // 一条记录只能占一行（记录是 `序号: 1 | 源地址: …`，按包含关系数）
+        long lines = r.text().lines().filter(l -> l.contains("10.0.0.1 10.0.0.11 10.0.0.21")).count();
         assertEquals(1, lines, "同一条记录被拆成了多行");
     }
 
