@@ -18,9 +18,9 @@ derived from measurement rather than guesswork.
 
 | 指标 | 值 |
 |---|---|
-| 语料规模 | **227 个文档 → 7,496 个 chunk** |
-| Redis 占用 | **280 MB**（含 HNSW 索引） |
-| 单 chunk 真实成本 | **38.3 KB**（`used_memory ÷ 条数`） |
+| 语料规模 | **227 个文档 → 7,520 个 chunk** |
+| Redis 占用 | **281 MB**（含 HNSW 索引） |
+| 单 chunk 真实成本 | **38.2 KB**（`used_memory ÷ 条数`） |
 | 单 chunk 嵌入耗时 | **0.18 ~ 0.3 秒**（64 条一批） |
 | 每 1 万 chunk | ≈ 375 MB |
 | 检索命中（59 题，答案所在片段进 top-5） | **53/59**（精确 40/44 · 泛问 13/15） |
@@ -29,7 +29,7 @@ derived from measurement rather than guesswork.
 | 全量摄入耗时 | **16 分钟**（4,497 块时的实测，单机单实例） |
 
 > **为什么是 38.3 KB 而不是 26.3 KB**：单条 chunk 的 JSON 键用 `MEMORY USAGE` 量出来是 26,298 字节，
-> 但 `used_memory ÷ 条数` 是 38.3 KB。差的十几 KB 是 HNSW 索引和分配开销。
+> 但 `used_memory ÷ 条数` 是 38.2 KB。差的十几 KB 是 HNSW 索引和分配开销。
 > **估容量必须用后者，拿单键大小当结论会系统性低估 40%** —— 这个错误我第一次就犯了。
 
 ---
@@ -475,7 +475,7 @@ score(d) = Σ_i  1 / (k + rank_i(d))        k = 60
 最初用 `MEMORY USAGE` 采样求平均，得出"单 chunk 26.5 KB"，据此推算能装 4~5 万个 chunk。
 
 跑完 4,497 条真实数据后核对：`used_memory` 162.1 MB ÷ 4,497 = **36.9 KB**，而所有键的 `MEMORY USAGE` 合计只有 112.8 MB。
-（库扩到 7,496 块后这个数是 **38.3 KB** —— 索引变大，单块成本还会缓慢上升。）
+（库扩到 7,520 块后这个数是 **38.2 KB** —— 索引变大，单块成本还会缓慢上升。）
 
 差的 49.3 MB 全是 HNSW 索引 + 分配开销，**这部分不会出现在单键统计里**。
 
