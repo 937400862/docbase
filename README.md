@@ -142,6 +142,7 @@ curl 'http://localhost:8800/api/ask?question=报销流程有哪些审批节点'
 | `BM25_ENABLED` | `true` | 关键词这一路的开关，关掉退化为纯向量 |
 | `EMBEDDING_MODEL` | `bge-m3` | 嵌入模型，换它必须同步改 `dimensions` 并重建索引 |
 | `SANITIZE_MODEL` | `llama3.2:3b` | 语义脱敏模型（该功能默认关闭） |
+| `MAX_FILE_SIZE_MB` | `10` | 单文件体积上限（MB），超过就跳过 |
 | `LOG_HOME` | `./logs` | 日志目录 |
 
 主要业务参数：
@@ -154,6 +155,7 @@ curl 'http://localhost:8800/api/ask?question=报销流程有哪些审批节点'
 | `rag.chat.bm25.enabled` | `true` | 关键词这一路的开关，关掉退化为纯向量 |
 | `rag.chat.bm25.rebuild-quiet-ms` | `3000` | 摄入事件后等多久安静再重建索引（合并连续摄入） |
 | `rag.chat.prompt-file` | `prompts/qa.txt` | 问答提示词模板（classpath） |
+| `rag.ingest.max-file-size-mb` | `10` | 单个文件的体积上限（MB），超过就跳过。要摄扫描件 PDF / 整本手册时调大；别一次调很大，Tika 解析大文件吃堆内存 |
 | `rag.ingest.embed-batch-size` | `64` | 单批嵌入条数，调大容易触发吞吐塌陷 |
 | `rag.ingest.max-redis-memory-mb` | `1000` | Redis 内存软上限，超限停止本批（已完成的文件重跑时自动跳过） |
 | `rag.ingest.progress-every` | `50` | 每多少个文件打一行进度 |

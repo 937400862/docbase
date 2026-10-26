@@ -148,6 +148,19 @@ public class DocumentIngestionService {
     private long maxRedisMemoryMb;
 
     /**
+     * 【改动 2026-10-26】单个文件的体积上限（MB），超过就跳过。
+     *
+     * <p>原来写死 10 MB。改成可配置是因为：clone 下来的人可能就要摄大文件
+     * （扫描件 PDF、整本手册），而本项目实测语料里最大也就几 MB，
+     * 10 MB 这个值对我们是够的，对别人不一定。
+     *
+     * <p>注意别一次调到很大：Tika 解析大文件会吃掉大量堆内存，超限时只会在解析阶段抛错，
+     * 前面已经入的块不会回滚。建议一次加一档，观察日志里的耗时。
+     */
+    @Value("${rag.ingest.max-file-size-mb:10}")
+    private long maxFileSizeMb;
+
+    /**
      * 【改动 2026-10-20 晚】新增：目录摄入时"每处理多少个文件打一次进度"。
      *
      * <p>原来每个文件都打一行 INFO，6 万多个文件会产生几百 MB 日志（10-17 那次 2250 个文件
@@ -848,9 +861,9 @@ public class DocumentIngestionService {
         try (Stream<Path> paths = Files.walk(rootPath)) {
             List<Path> fileList = paths
                     .filter(Files::isRegularFile)          // 只处理普通文件
-                    // 【改动】原来的过滤逻辑是写在这里的一大坨 lambda，现在抽成 shouldIngest(Path)，
+                    // 【改动】原来的过滤逻辑是写在这里的一大坨 lambda，现在抽成 shouldIngest(Path, maxBytes)，
                     // 一是加注释后不至于挤成一团，二是可以单独测（见本轮验证）
-                    .filter(DocumentIngestionService::shouldIngest)
+                    .filter(p -> shouldIngest(p, maxFileSizeMb * 1024 * 1024))
                     .toList();
 
             int total = fileList.size();
@@ -972,7 +985,13 @@ public class DocumentIngestionService {
      *   <li>大于 10MB</li>
      * </ol>
      */
-    static boolean shouldIngest(Path p) {
+    /**
+     * 批量摄入前的过滤：隐藏文件、无关目录、Office 锁文件、垃圾后缀、超大文件。
+     *
+     * @param p            待判断的文件
+     * @param maxFileBytes 体积上限（字节），来自配置 {@code rag.ingest.max-file-size-mb}
+     */
+    static boolean shouldIngest(Path p, long maxFileBytes) {
         // 跳过隐藏文件（如 .gitignore、.DS_Store）
         if (p.getFileName().toString().startsWith(".")) {
             return false;
@@ -1001,9 +1020,9 @@ public class DocumentIngestionService {
             }
         }
 
-        // 跳过超大文件
+        // 跳过超大文件（上限可配置，见 rag.ingest.max-file-size-mb）
         try {
-            return Files.size(p) <= 10 * 1024 * 1024;
+            return Files.size(p) <= maxFileBytes;
         } catch (IOException e) {
             return false;
         }
