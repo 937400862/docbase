@@ -97,6 +97,22 @@ public class DocumentIngestionService {
     private static final int FILENAME_FALLBACK_MIN_HAN = 10;
 
     /**
+     * 按后缀直接判为垃圾、不解析也不入库的格式。
+     *
+     * <p>其中 bcmap / rpm / pfx / cer / vsdx / rp 这几种实测 Tika 只能抽出 0~1 个字符，
+     * 全库共 1,704 个（bcmap 1,176 / rpm 250 / pfx+cer 152 / vsdx 58 / rp 18），
+     * 纯属浪费解析时间；.bcmap 是 PDF 的字体映射文件，会被当 PDF 解析，最费时间。
+     *
+     * <p><b>这个判断必须早于「内容过短 → 文件名兜底」</b>：否则一个叫「xxx说明」的 .rpm
+     * 会因为名字够长而被当成正文入库。批量摄入时 {@link #shouldIngest} 已经先挡住了，
+     * 但单文件摄入接口是直接调 {@code ingestFile}，绕过了那一层，所以兜底分支里要再判一次。
+     */
+    private static final String[] SKIP_EXTENSIONS = {".jar", ".war", ".class", ".exe", ".dll",
+            ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3",
+            ".zip", ".rar", ".7z", ".tar", ".gz",
+            ".bcmap", ".rpm", ".pfx", ".cer", ".vsdx", ".rp"};
+
+    /**
      * 【改动 2026-10-22】id 规则：`<路径哈希>#<chunk 序号>`。
      *
      * <p>背景：10-20 那版用了一个 Redis SET 记录"已摄入文件"，等于多维护一套状态。
@@ -617,8 +633,16 @@ public class DocumentIngestionService {
                 //
                 // 只对「中文长名」兜底：之前实测被这里挡掉的 1,704 个文件是 bcmap / rpm / ~$ 锁文件，
                 // 名字都是短英文，不会命中这条规则。
+                String lower = fileName.toLowerCase();
+                boolean junkExt = false;
+                for (String ext : SKIP_EXTENSIONS) {
+                    if (lower.endsWith(ext)) {
+                        junkExt = true;
+                        break;
+                    }
+                }
                 String stem = stripExtension(fileName);
-                if (chineseCount(stem) >= FILENAME_FALLBACK_MIN_HAN) {
+                if (!junkExt && chineseCount(stem) >= FILENAME_FALLBACK_MIN_HAN) {
                     log.info("正文过短（{} 字符），改用文件名入库: {}", totalChars, fileName);
                     cleaned = new ArrayList<>(List.of(stem));
                 } else {
@@ -971,14 +995,7 @@ public class DocumentIngestionService {
             return false;
         }
 
-        String[] skipExts = {".jar", ".war", ".class", ".exe", ".dll",
-                ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3",
-                ".zip", ".rar", ".7z", ".tar", ".gz",
-                // 【改动】新增：实测 Tika 只能抽出 0~1 个字符的二进制格式，全库共 1704 个
-                //   （bcmap 1176 / rpm 250 / pfx+cer 152 / vsdx 58 / rp 18）。
-                //   其中 .bcmap 是 PDF 的字体映射文件，会被当 PDF 解析，最费时间。
-                ".bcmap", ".rpm", ".pfx", ".cer", ".vsdx", ".rp"};
-        for (String ext : skipExts) {
+        for (String ext : SKIP_EXTENSIONS) {
             if (name.endsWith(ext)) {
                 return false;
             }
