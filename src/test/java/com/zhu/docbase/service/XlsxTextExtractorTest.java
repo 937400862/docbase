@@ -320,4 +320,111 @@ class XlsxTextExtractorTest {
         assertEquals(0, r.stats().transposedSheets(), "宽表被误判成转置表了：\n" + r.text());
         assertTrue(r.text().contains("表头: "), "宽表没有走原来的单元格墙渲染：\n" + r.text());
     }
+
+    /**
+     * 造一张 12 列的表，专门用来测摘要块的三件事：
+     * <ol>
+     *   <li>列数超过 6 时，靠后的列还能不能进摘要（2026-10-26 把上限从 6 提到 12）</li>
+     *   <li>「备注」列每行都不同，能不能豁免"几乎每行都不一样就不摘"那条</li>
+     *   <li>某一列取值又多又长时，会不会折叠成「…（共 N 种）」而不是把额度吃光</li>
+     * </ol>
+     * 另外第 12 列表头故意留空，让渲染器起一个「列12」占位名，用来测表头过滤。
+     */
+    private Path buildWideSummaryTable(Path dir) throws Exception {
+        Path file = dir.resolve("宽摘要表.xlsx");
+        try (Workbook wb = new XSSFWorkbook(); OutputStream out = Files.newOutputStream(file)) {
+            Sheet sh = wb.createSheet("Sheet1");
+            String[] cols = {"序号", "区域", "用途", "源地址", "目标区域", "目标用途",
+                    "目标地址", "端口", "备注", "单位", "状态", ""};
+            Row h = sh.createRow(0);
+            for (int i = 0; i < cols.length; i++) {
+                h.createCell(i).setCellValue(cols[i]);
+            }
+            // 8 种取值、每种 19 字 —— 列举出来超过单列 120 字上限，应该被折叠。
+            // 单个值不能超过 24 字（SUMMARY_MAX_VALUE_LEN），否则会被当描述性字段整列丢掉
+            String[] longValues = {"统一门户接入服务甲类业务处理链路第一段", "统一门户接入服务甲类业务处理链路第二段",
+                    "统一门户接入服务甲类业务处理链路第三段", "统一门户接入服务甲类业务处理链路第四段",
+                    "统一门户接入服务甲类业务处理链路第五段", "统一门户接入服务甲类业务处理链路第六段",
+                    "统一门户接入服务甲类业务处理链路第七段", "统一门户接入服务甲类业务处理链路第八段"};
+            for (int r = 0; r < 12; r++) {
+                Row row = sh.createRow(r + 1);
+                row.createCell(0).setCellValue(String.valueOf(r + 1));
+                row.createCell(1).setCellValue(r % 2 == 0 ? "甲区" : "乙区");
+                row.createCell(2).setCellValue(r % 3 == 0 ? "用途甲" : "用途乙");
+                row.createCell(3).setCellValue("[IP] [IP] " + r);   // 每行不同 → 不豁免，应被跳过
+                row.createCell(4).setCellValue(r % 2 == 0 ? "乙区" : "甲区");
+                row.createCell(5).setCellValue(longValues[r % longValues.length]);
+                // 纯脱敏占位符列 → 只报数量，不列举（列举出来是几十个字符的 [IP]，零信息）。
+                // 分隔符故意用 NBSP（\u00A0）：表格里实际就是这个，而 Java 的 \s 不匹配它 ——
+                // 只用普通空格造数据的话，正则在生产数据上永远不命中，单测却会通过
+                row.createCell(6).setCellValue(switch (r % 3) {
+                    case 0 -> "[IP]";
+                    case 1 -> "[IP]\u00A0[IP]";
+                    default -> "[IP]\u00A0[IP]\u00A0[IP]";
+                });
+                row.createCell(7).setCellValue(String.valueOf(8000 + r));
+                row.createCell(8).setCellValue("服务" + (char) ('A' + r));  // 12 种不同，靠豁免进来
+                row.createCell(9).setCellValue(r % 2 == 0 ? "单位甲" : "单位乙");
+                row.createCell(10).setCellValue(r % 3 == 0 ? "正常" : "停用");
+                row.createCell(11).setCellValue("值" + r);          // 表头空 → 占位列
+            }
+            wb.write(out);
+        }
+        return file;
+    }
+
+    @Test
+    @DisplayName("摘要块：12 列的表能摘到第 7 个合格列（上限从 6 提到 12）")
+    void summaryCoversColumnsBeyondSix(@TempDir Path dir) throws Exception {
+        XlsxTextExtractor.Result r = new XlsxTextExtractor().extract(buildWideSummaryTable(dir).toFile());
+        String summary = String.join("\n", r.sideChunks());
+        // 合格列依次是：区域、用途、目标区域、目标用途、目标地址、备注、单位、状态 —— 「状态」排第 8。
+        // 上限还是 6 的话它进不来，这正是那张 12 列表丢「备注」列的同一个毛病。
+        assertTrue(summary.contains("状态"), "摘要只摘到前 6 列，靠后的列没进来：\n" + summary);
+    }
+
+    @Test
+    @DisplayName("摘要块：备注列每行都不同，也要能进摘要")
+    void summaryKeepsNoteColumnEvenIfAllDistinct(@TempDir Path dir) throws Exception {
+        XlsxTextExtractor.Result r = new XlsxTextExtractor().extract(buildWideSummaryTable(dir).toFile());
+        String summary = String.join("\n", r.sideChunks());
+        assertTrue(summary.contains("备注"), "备注列被「每行都不一样」那条挡掉了：\n" + summary);
+        assertTrue(summary.contains("服务A") && summary.contains("服务C"),
+                "备注列的取值没有列举出来：\n" + summary);
+    }
+
+    @Test
+    @DisplayName("摘要块：单列取值太长时折叠成「…（共 N 种）」")
+    void summaryFoldsLongColumn(@TempDir Path dir) throws Exception {
+        XlsxTextExtractor.Result r = new XlsxTextExtractor().extract(buildWideSummaryTable(dir).toFile());
+        String summary = String.join("\n", r.sideChunks());
+        assertTrue(summary.contains("…（共 8 种）"),
+                "长取值列没有折叠，会把别的列的额度吃光：\n" + summary);
+    }
+
+    @Test
+    @DisplayName("摘要块：纯脱敏占位符列只报数量，不列举 [IP]")
+    void summaryCollapsesMaskedColumn(@TempDir Path dir) throws Exception {
+        XlsxTextExtractor.Result r = new XlsxTextExtractor().extract(buildWideSummaryTable(dir).toFile());
+        String summary = String.join("\n", r.sideChunks());
+        assertTrue(summary.contains("目标地址（共 3 种）"),
+                "占位列没有被折叠成只报数量：\n" + summary);
+        assertFalse(summary.contains("[IP]"),
+                "占位列还在列举 [IP]，会把真正有内容的列挤掉：\n" + summary);
+    }
+
+    @Test
+    @DisplayName("表头不渲染占位列名（列7、列8…），避免模型照抄成答案")
+    void placeholderColumnsAreHiddenInHeader(@TempDir Path dir) throws Exception {
+        XlsxTextExtractor.Result r = new XlsxTextExtractor().extract(buildWideSummaryTable(dir).toFile());
+        String headerLine = r.text().lines()
+                .filter(l -> l.startsWith("表头: "))
+                .findFirst().orElse("");
+        assertFalse(headerLine.isEmpty(), "没找到表头行：\n" + r.text());
+        assertFalse(headerLine.matches(".*列\\d+.*"),
+                "表头里还挂着占位列名，模型会照着抄：\n" + headerLine);
+        // 真实的列名不能被误伤
+        assertTrue(headerLine.contains("状态") && headerLine.contains("备注"),
+                "过滤占位列时把真实列名也删了：\n" + headerLine);
+    }
 }

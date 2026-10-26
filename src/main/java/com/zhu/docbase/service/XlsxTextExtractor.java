@@ -167,11 +167,56 @@ public class XlsxTextExtractor {
     /** 前 N 个合计占不到这个比例，说明取值太散（编号、IP），不值得摘 */
     private static final double SUMMARY_TOPN_MIN_COVER = 0.35;
 
-    /** 单个 sheet 最多摘几列，防止宽表把第一块撑爆 */
-    private static final int SUMMARY_MAX_COLUMNS = 6;
+    /** 单个 sheet 最多摘几列，防止宽表把摘要撑爆 */
+    private static final int SUMMARY_MAX_COLUMNS = 12;
 
-    /** 单个 sheet 的摘要总字数上限（摘要和【表】行同在块 0，块只有约 800 字预算） */
-    private static final int SUMMARY_MAX_CHARS = 600;
+    /**
+     * 单个 sheet 的摘要总字数上限。
+     *
+     * <p>【2026-10-26 改 600 → 1200】摘要已经是独立块（{@code Result.sideChunks}），
+     * 不再和【表】行挤块 0 的 800 字预算，所以可以放宽。
+     * bge-m3 支持 8192 token，1200 字远没到 embedding 的上限。
+     *
+     * <p>为什么必须放宽：600 字装不下 12 列。实测一张 12 列的表，
+     * 光 6 列（含两个 IP 列）就占了 352 字，真正有信息量的「备注」列被挤掉，
+     * 而那道题的答案恰好全在备注列里。
+     */
+    private static final int SUMMARY_MAX_CHARS = 1200;
+
+    /**
+     * 单列列举的字数上限，超了改成「只留前几个…（共 N 种）」。
+     *
+     * <p>【2026-10-26 定 120】定 60 时踩过坑：一列「备注」有 15 种取值、
+     * 4 个答案分散在中间，60 字只列到前 4 个，答案被截掉一半。
+     * 摘要块是独立块，放宽到 120 字对 embedding 没有影响。
+     *
+     * <p>真正需要压的是 {@link #MASK_VALUE} 那种零信息占位列，那个走单独分支。
+     */
+    private static final int SUMMARY_MAX_LINE_CHARS = 120;
+
+    /**
+     * 脱敏后的占位符取值（{@code [IP]}、{@code [PHONE]}、{@code [PERSON]}，可能连续多个）。
+     *
+     * <p>这类列列举出来是 40~60 字但信息量为零，只会把别的列的额度吃光。
+     * 整列过半是占位符时，只报「共 N 种」，不列举。
+     *
+     * <p>分隔符必须显式带上 NBSP / 全角空格 / 零宽空格：Java 的 {@code \s} 默认不匹配它们，
+     * 而表格里 {@code [IP] [IP]} 中间那个空格实测是 NBSP。
+     * 只用 {@code \s} 的话这条分支在生产数据上一次都不会命中 —— 单测用普通空格反而能过，
+     * 典型的"测了但没测到"。
+     */
+    private static final Pattern MASK_VALUE =
+            Pattern.compile("^(\\[[A-Z]+][\\s\\u00A0\\u3000\\u200B]*)+$");
+
+    /**
+     * 备注类列：取值往往各不相同，但恰恰是「有哪些 X」这类问题的答案所在。
+     *
+     * <p>实测一张 12 列的表，「备注」列 16 个非空值、16 种不同（都是「某某访问」「某某推送」
+     * 这类短标签），正好被下面「几乎每行都不一样就不摘」那条挡掉。
+     * 这条豁免让备注列能进摘要，代价是可能混进少量描述性内容 ——
+     * 由 {@link #SUMMARY_MAX_VALUE_LEN} 兜底（超过 24 字的单个值仍然不要）。
+     */
+    private static final Pattern NOTE_COL = Pattern.compile(".*备注.*");
 
     /** 渲染器给没有表头的列起的占位名（列7、列8…），摘它们没有意义 */
     private static final Pattern PLACEHOLDER_COL = Pattern.compile("列\\d+");
@@ -550,7 +595,19 @@ public class XlsxTextExtractor {
 
                 // 表头行：留一行列名清单，便于回答"这张表有哪些列"这类问题。
                 // 每条记录自带键名，所以它不是记录可读的前提，只是补一个表级视图。
-                sb.append("表头: ").append(String.join(" | ", header)).append('\n');
+                //
+                // 【2026-10-26 改】跳过渲染器起的占位列名（列7、列8…）。
+                // 实测踩到的坑：一张表的表头末尾挂着「列13 | 列14」两个空占位列，
+                // 问题问"包含哪几列"，模型直接照着抄「列13 和 列14」——
+                // 而正确的四个列名就在同一行的前面，它全看见了还是抄错。
+                // 占位列名对任何问题都没有信息量，留着只会当诱饵。
+                List<String> shownHeader = new ArrayList<>(header.size());
+                for (String h : header) {
+                    if (!PLACEHOLDER_COL.matcher(h).matches()) {
+                        shownHeader.add(h);
+                    }
+                }
+                sb.append("表头: ").append(String.join(" | ", shownHeader)).append('\n');
 
                 for (List<String> row : body) {
                     // 行级键值：一条记录一行，字段之间用 | 分隔。
@@ -755,19 +812,34 @@ public class XlsxTextExtractor {
                 if ((double) totalLen / nonEmpty > SUMMARY_MAX_AVG_LEN) {
                     continue;
                 }
-                // 几乎每行都不一样的列（编号、流水号）不是类别列；表很小的时候不这么判
-                if (nonEmpty > 8 && freq.size() > nonEmpty * 0.9) {
+                // 几乎每行都不一样的列（编号、流水号）不是类别列；表很小的时候不这么判。
+                // 备注类列豁免：取值虽然各不相同，但往往正是「有哪些 X」的答案所在
+                if (nonEmpty > 8 && freq.size() > nonEmpty * 0.9
+                        && !NOTE_COL.matcher(col).matches()) {
                     continue;
                 }
                 StringBuilder b = new StringBuilder(col).append(": ");
-                int shown = 0;
-                for (String v : freq.keySet()) {
-                    if (shown++ > 0) {
-                        b.append('、');
+                // 整列过半是脱敏占位符 → 只报数量。列举出来是几十个字符的 [IP]，零信息
+                long masked = freq.keySet().stream()
+                        .filter(v -> MASK_VALUE.matcher(v).matches()).count();
+                if (masked * 2 > freq.size()) {
+                    line = col + "（共 " + freq.size() + " 种）";
+                } else {
+                    int shown = 0;
+                    boolean truncated = false;
+                    for (String v : freq.keySet()) {
+                        if (b.length() + v.length() > SUMMARY_MAX_LINE_CHARS) {
+                            truncated = true;
+                            break;
+                        }
+                        if (shown++ > 0) {
+                            b.append('、');
+                        }
+                        b.append(v);
                     }
-                    b.append(v);
+                    line = b.append(truncated ? "…" : "")
+                            .append("（共 ").append(freq.size()).append(" 种）").toString();
                 }
-                line = b.append("（共 ").append(freq.size()).append(" 种）").toString();
             } else {
                 if (nonEmpty < SUMMARY_TOPN_MIN_ROWS) {
                     continue;
