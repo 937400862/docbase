@@ -116,21 +116,28 @@ public class RagController {
      * 因为这才是 /ask 实际用的路径 —— 评测必须量真实行为，不能量一个已经不在用的旧链路。
      * 要对比纯向量，加 {@code vectorOnly=true}。
      *
+     * <p>【2026-10-26 改动】默认做来源去重（同一份文档最多留 max-per-doc 块），
+     * 和 /ask 保持一致。想看「不去重时 gold 真实排第几」，加 {@code dedup=false}。
+     *
      * @param question   问题
      * @param topK       返回多少个候选，默认 20（比问答时的 5 宽，用于观察召回上限）
      * @param vectorOnly 只看纯向量检索（2026-10-23 之前的链路）
+     * @param dedup      是否做来源去重，默认 true
      */
     @GetMapping("/retrieve")
     public String retrieve(@RequestParam String question,
                            @RequestParam(defaultValue = "20") int topK,
-                           @RequestParam(defaultValue = "false") boolean vectorOnly) {
+                           @RequestParam(defaultValue = "false") boolean vectorOnly,
+                           @RequestParam(defaultValue = "true") boolean dedup) {
         List<Document> docs = vectorOnly
                 ? vectorStore.similaritySearch(
                         SearchRequest.builder().query(question).topK(topK).build())
-                : hybridRetriever.retrieveFused(question, topK);
+                : hybridRetriever.retrieveFused(question, topK, dedup);
         StringBuilder sb = new StringBuilder();
         sb.append("命中 ").append(docs.size()).append(" 个候选")
-                .append(vectorOnly ? "（纯向量）" : "（混合检索：向量+BM25→RRF）").append("\n\n");
+                .append(vectorOnly ? "（纯向量）"
+                        : dedup ? "（混合检索：向量+BM25→RRF→来源去重）"
+                        : "（混合检索：向量+BM25→RRF，未去重）").append("\n\n");
         for (int i = 0; i < docs.size(); i++) {
             Document d = docs.get(i);
             sb.append("### RANK ").append(i + 1)
