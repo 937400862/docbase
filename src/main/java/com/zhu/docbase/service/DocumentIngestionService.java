@@ -93,6 +93,9 @@ public class DocumentIngestionService {
      */
     private static final int MIN_TEXT_CHARS = 20;
 
+    /** 正文抽不出来时，文件名至少要有这么多汉字才值得兜底入库（挡掉 bcmap / rpm 这类垃圾文件名） */
+    private static final int FILENAME_FALLBACK_MIN_HAN = 10;
+
     /**
      * 【改动 2026-10-22】id 规则：`<路径哈希>#<chunk 序号>`。
      *
@@ -606,8 +609,22 @@ public class DocumentIngestionService {
             //    以前会走完切分得到 0 片段并被记成"摄入失败"。
             int totalChars = cleaned.stream().mapToInt(String::length).sum();
             if (totalChars < MIN_TEXT_CHARS) {
-                log.warn("跳过: 解析出内容过短（{} 字符）", totalChars);
-                return IngestResult.skipShort();
+                // 【2026-10-26 修】正文抽不出来时，用文件名兜底。
+                //
+                // 起因：库里查不到一份 .doc —— 它的正文是空的（Tika 只解析出不到 20 字符），
+                // 于是被这里整份跳过。但它的**文件名本身就是结论**（形如
+                // 「xxx四家银行有xxx模式.doc」），跳过等于让库里永远没有这条信息。
+                //
+                // 只对「中文长名」兜底：之前实测被这里挡掉的 1,704 个文件是 bcmap / rpm / ~$ 锁文件，
+                // 名字都是短英文，不会命中这条规则。
+                String stem = stripExtension(fileName);
+                if (chineseCount(stem) >= FILENAME_FALLBACK_MIN_HAN) {
+                    log.info("正文过短（{} 字符），改用文件名入库: {}", totalChars, fileName);
+                    cleaned = new ArrayList<>(List.of(stem));
+                } else {
+                    log.warn("跳过: 解析出内容过短（{} 字符）", totalChars);
+                    return IngestResult.skipShort();
+                }
             }
 
             // 5. 组装成 Spring AI 的 Document
@@ -1079,4 +1096,21 @@ public class DocumentIngestionService {
         };
     }
 
+
+    /** 去掉扩展名 */
+    private static String stripExtension(String name) {
+        int i = name.lastIndexOf('.');
+        return i > 0 ? name.substring(0, i) : name;
+    }
+
+    /** 统计汉字个数（用于判断"文件名是不是一句话"） */
+    private static int chineseCount(String s) {
+        int n = 0;
+        for (int i = 0; i < s.length(); i++) {
+            if (Character.UnicodeScript.of(s.charAt(i)) == Character.UnicodeScript.HAN) {
+                n++;
+            }
+        }
+        return n;
+    }
 }
