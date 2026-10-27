@@ -22,11 +22,15 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
@@ -168,6 +172,14 @@ public class DocumentIngestionService {
      */
     @Value("${rag.ingest.progress-every:50}")
     private int progressEvery;
+
+    /**
+     * 块首是否追加「文件日期 / 版本」标签。默认 false（关闭），行为与改动前逐字一致。
+     *
+     * <p>打开后每块多约 20 字，会让所有块向量变化 → **必须全量重摄**才生效。
+     */
+    @Value("${rag.ingest.block-date-prefix:false}")
+    private boolean blockDatePrefix;
 
     /**
      * 【改动 2026-10-22】单次嵌入的批大小。
@@ -500,7 +512,7 @@ public class DocumentIngestionService {
         // 剩下是 1024 维向量的 JSON 文本。内存由 chunk 数量决定，不由正文长度决定，
         // 加 30 字符只让单键从 26,298 变成约 26,328 字节（+0.1%）。
         // 真正的成本在 prompt：每个检索片段多约 30 token，topK=5 多 150 token。
-        String prefix = "【来源：" + file.getName() + "】\n";
+        String prefix = "【来源：" + file.getName() + "】" + dateTag(file) + "\n";
         for (int i = 0; i < total; i++) {
             Document d = chunks.get(i);
             Map<String, Object> meta = new HashMap<>();
@@ -514,6 +526,71 @@ public class DocumentIngestionService {
         }
         return out;
     }
+
+    /**
+     * 块首的「日期 / 版本」标签（2026-10-27 新增，开关 {@code rag.ingest.block-date-prefix}）。
+     *
+     * <p>要解决的是「同一份文档的多个版本都在库里，检索分不出新旧」：
+     * 有的题问"最新版本号"，top-k 全是旧版本的块；有的题要的是某次评审之后的结论，
+     * 而 top-k 里 V1.2/V1.4/V1.5 混在一起。
+     *
+     * <p>来源只有文件名：<b>文件名里的日期 → 文件名里的版本号</b>，两样都没有就**不加标签**。
+     * 不用 mtime 兜底 —— 那是拷贝/同步时间，不是文档日期，加了反而给旧文档盖"新版本"章。
+     *
+     * <p>返回 {@code ""} 表示不加标签 —— 关掉开关时行为与改动前逐字一致。
+     */
+    String dateTag(File file) {
+        if (!blockDatePrefix) {
+            return "";
+        }
+        return buildDateTag(file.getName());
+    }
+
+    /** 静态实现，给单测直接调（不启动 Spring、不碰磁盘） */
+    static String buildDateTag(String fileName) {
+        if (fileName == null || fileName.isEmpty()) {
+            return "";
+        }
+        String date = null;
+        Matcher dm = DATE_IN_NAME.matcher(fileName);
+        while (dm.find()) {
+            int mo = Integer.parseInt(dm.group(2));
+            int day = Integer.parseInt(dm.group(3));
+            if (mo >= 1 && mo <= 12 && day >= 1 && day <= 31) {
+                date = dm.group(1) + "-" + dm.group(2) + "-" + dm.group(3);
+                break;   // 取第一个合法日期，文件名里通常只有一个
+            }
+        }
+        String ver = null;
+        Matcher vm = VERSION_IN_NAME.matcher(fileName);
+        if (vm.find()) {
+            ver = "V" + vm.group(1);
+        }
+        if (date == null && ver == null) {
+            // 没有就是没有：**不用 mtime 兜底**。
+            // mtime 是拷贝/同步时间，不是文档日期。实测把一份没有日期前缀的旧文档标成「2025-05-23」，
+            // 等于给旧文档盖了个"新版本"章 —— 宁可没有标签，也不要错的标签。
+            return "";
+        }
+        StringBuilder sb = new StringBuilder("【");
+        if (date != null) {
+            sb.append("文件日期：").append(date);
+        }
+        if (ver != null) {
+            if (date != null) {
+                sb.append("｜");
+            }
+            sb.append("版本：").append(ver);
+        }
+        return sb.append("】").toString();
+    }
+
+    /** 文件名里的 8 位日期：20240930 / 20250328 */
+    private static final Pattern DATE_IN_NAME = Pattern.compile("(20\\d{2})(\\d{2})(\\d{2})");
+
+    /** 文件名里的版本号：V1.5 / v1.37 / V1.51 */
+    private static final Pattern VERSION_IN_NAME = Pattern.compile("[vV](\\d+(?:\\.\\d+)+)");
+
 
     /**
      * 【改动 2026-10-20 晚】读 Redis 当前已用内存（MB）。
