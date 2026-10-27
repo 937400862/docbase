@@ -123,21 +123,28 @@ public class RagController {
      * @param topK       返回多少个候选，默认 20（比问答时的 5 宽，用于观察召回上限）
      * @param vectorOnly 只看纯向量检索（2026-10-23 之前的链路）
      * @param dedup      是否做来源去重，默认 true
+     * @param metaQuota  元数据块（【表】/【列取值】）在结果里最多占几个名额；-1 = 用配置默认值，
+     *                   0 = 不限。评测 A/B 时直接传 0 / 1 对比
      */
     @GetMapping("/retrieve")
     public String retrieve(@RequestParam String question,
                            @RequestParam(defaultValue = "20") int topK,
                            @RequestParam(defaultValue = "false") boolean vectorOnly,
-                           @RequestParam(defaultValue = "true") boolean dedup) {
+                           @RequestParam(defaultValue = "true") boolean dedup,
+                           @RequestParam(defaultValue = "-1") int metaQuota) {
         List<Document> docs = vectorOnly
                 ? vectorStore.similaritySearch(
                         SearchRequest.builder().query(question).topK(topK).build())
-                : hybridRetriever.retrieveFused(question, topK, dedup);
+                : metaQuota >= 0
+                        ? hybridRetriever.retrieveFused(question, topK, dedup, metaQuota)
+                        : hybridRetriever.retrieveFused(question, topK, dedup);
         StringBuilder sb = new StringBuilder();
         sb.append("命中 ").append(docs.size()).append(" 个候选")
                 .append(vectorOnly ? "（纯向量）"
                         : dedup ? "（混合检索：向量+BM25→RRF→来源去重）"
-                        : "（混合检索：向量+BM25→RRF，未去重）").append("\n\n");
+                        : "（混合检索：向量+BM25→RRF，未去重）")
+                .append(metaQuota >= 0 ? "｜元数据块名额=" + metaQuota : "")
+                .append("\n\n");
         for (int i = 0; i < docs.size(); i++) {
             Document d = docs.get(i);
             sb.append("### RANK ").append(i + 1)

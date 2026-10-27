@@ -113,4 +113,81 @@ class HybridRetrieverTest {
 
         assertEquals(List.of("doc:A#0", "doc:B#0", "doc:A#1", "doc:C#0"), idsOf(out));
     }
+
+    // ================= 元数据块名额（2026-10-27 新增）=================
+
+    private static Document metaDoc(String id, String tag) {
+        return new Document(id, "【来源：某表.xlsx】 " + tag + "某表.xlsx｜sheet: S1｜列: A、B", Map.of());
+    }
+
+    @Test
+    @DisplayName("元数据块识别：要跳过【来源：…】前缀，别直接 startsWith")
+    void detectsMetaBlockAfterSourcePrefix() {
+        assertTrue(HybridRetriever.isMetaBlock("【来源：a.xlsx】 【表】a.xlsx｜sheet: S1"));
+        assertTrue(HybridRetriever.isMetaBlock("【来源：a.xlsx】\n【列取值】a.xlsx｜sheet: S1"));
+        assertTrue(HybridRetriever.isMetaBlock("【表】没有来源前缀的块"));
+        assertEquals(false, HybridRetriever.isMetaBlock("【来源：a.xlsx】 正文第一段"));
+        assertEquals(false, HybridRetriever.isMetaBlock("正文里提到【表】但不在块首"));
+        assertEquals(false, HybridRetriever.isMetaBlock(null));
+    }
+
+    @Test
+    @DisplayName("名额=1：top5 里【表】+【列取值】合计只占 1 个，其余用后面的正文块补满")
+    void metaQuotaKeepsOnlyOneMetadataBlock() {
+        List<Document> ranked = List.of(
+                metaDoc("doc:A#0", "【表】"),
+                metaDoc("doc:B#0", "【列取值】"),
+                new Document("doc:C#0", "【来源：c.docx】 正文块一", Map.of()),
+                new Document("doc:D#0", "【来源：d.docx】 正文块二", Map.of()),
+                new Document("doc:E#0", "【来源：e.docx】 正文块三", Map.of()),
+                new Document("doc:F#0", "【来源：f.docx】 正文块四", Map.of()));
+
+        List<Document> out = HybridRetriever.select(ranked, 5, 0, 1);
+
+        assertEquals(5, out.size());
+        // 名额给第一个元数据块（A#0），B#0 被跳过，后面的正文块整体上移补满
+        assertEquals(List.of("doc:A#0", "doc:C#0", "doc:D#0", "doc:E#0", "doc:F#0"), idsOf(out));
+        assertEquals(1, out.stream().filter(d -> HybridRetriever.isMetaBlock(d.getText())).count());
+    }
+
+    @Test
+    @DisplayName("名额=0 时行为与改动前一致（不限元数据块）")
+    void zeroMetaQuotaIsNoop() {
+        List<Document> ranked = List.of(
+                metaDoc("doc:A#0", "【表】"),
+                metaDoc("doc:B#0", "【列取值】"),
+                new Document("doc:C#0", "正文", Map.of()));
+
+        assertEquals(idsOf(ranked), idsOf(HybridRetriever.select(ranked, 3, 0, 0)));
+    }
+
+    @Test
+    @DisplayName("元数据块太少补不满时，宁可放宽名额也要凑够条数")
+    void metaQuotaRelaxesRatherThanReturningShortList() {
+        List<Document> ranked = List.of(
+                metaDoc("doc:A#0", "【表】"),
+                metaDoc("doc:B#0", "【列取值】"));
+
+        List<Document> out = HybridRetriever.select(ranked, 2, 0, 1);
+
+        assertEquals(2, out.size());
+    }
+
+    @Test
+    @DisplayName("两个限额同时生效：文档限额和元数据名额都不破")
+    void bothLimitsTogether() {
+        List<Document> ranked = List.of(
+                metaDoc("doc:A#0", "【表】"),
+                metaDoc("doc:A#1", "【列取值】"),
+                new Document("doc:A#2", "【来源：a.xlsx】 正文 A2", Map.of()),
+                new Document("doc:B#0", "【来源：b.docx】 正文 B0", Map.of()),
+                new Document("doc:C#0", "【来源：c.docx】 正文 C0", Map.of()));
+
+        List<Document> out = HybridRetriever.select(ranked, 3, 1, 1);
+
+        assertEquals(3, out.size());
+        assertEquals(1, out.stream().filter(d -> HybridRetriever.isMetaBlock(d.getText())).count());
+        // 每份文档最多 1 块
+        assertEquals(3, out.stream().map(d -> HybridRetriever.docKey(d.getId())).distinct().count());
+    }
 }

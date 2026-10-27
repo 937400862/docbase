@@ -80,6 +80,18 @@ public class HybridRetriever {
     @Value("${rag.chat.max-per-doc:0}")
     private int maxPerDoc;
 
+    /**
+     * 元数据块（块首标签是【表】或【列取值】）在 top-k 里最多占几个名额。0 = 不限。
+     *
+     * <p>为什么需要它：这两类块是"目录/摘要"，字数少、列名齐全、和问题措辞相似度高，
+     * 天然容易排到前面；一旦它们挤进 top-k，正文块就被挤出去，模型只能看到目录看不到内容。
+     * 实测 P9 的 top5 是 #1【表】#2【列取值】#3 正文，gold 在正文里 → 覆盖率 100%→0%。
+     *
+     * <p>和「来源去重」不是一回事：那个限的是同一份文档的所有块，这个只限两类元数据块。
+     */
+    @Value("${rag.chat.meta-block-quota:0}")
+    private int metaBlockQuota;
+
     public HybridRetriever(VectorStore vectorStore, Bm25IndexService bm25Index) {
         this.vectorStore = vectorStore;
         this.bm25Index = bm25Index;
@@ -103,7 +115,12 @@ public class HybridRetriever {
      *              想知道「不去重时 gold 真实排第几」时传 false 做对照
      */
     public List<Document> retrieveFused(String question, int top, boolean dedup) {
-        return retrieve(question, Math.max(top, recallK), top, rrfK, dedup);
+        return retrieve(question, Math.max(top, recallK), top, rrfK, dedup, metaBlockQuota);
+    }
+
+    /** 显式指定元数据块名额，给评测 A/B 用（0 = 不限，1 = 最多占 1 个） */
+    public List<Document> retrieveFused(String question, int top, boolean dedup, int metaQuota) {
+        return retrieve(question, Math.max(top, recallK), top, rrfK, dedup, metaQuota);
     }
 
     public List<Document> retrieve(String question, int recall, int top, int k) {
@@ -111,25 +128,29 @@ public class HybridRetriever {
     }
 
     public List<Document> retrieve(String question, int recall, int top, int k, boolean dedup) {
+        return retrieve(question, recall, top, k, dedup, metaBlockQuota);
+    }
+
+    public List<Document> retrieve(String question, int recall, int top, int k, boolean dedup, int metaQuota) {
         List<Document> vec = vectorStore.similaritySearch(
                 SearchRequest.builder().query(question).topK(recall).build());
 
         // BM25 未就绪（启动后约 12 秒内）或已禁用时，退化为纯向量，不能因此报错
         if (!bm25Index.isReady()) {
             log.debug("BM25 索引未就绪，本次退化为纯向量检索");
-            List<Document> pure = dedup ? dedup(vec, top) : vec;
-            return pure.size() > top ? pure.subList(0, top) : pure;
+            return select(vec, top, dedup ? maxPerDoc : 0, metaQuota);
         }
 
         List<String> kwIds = bm25Index.search(question, recall);
-        return fuse(vec, kwIds, top, k, dedup);
+        return fuse(vec, kwIds, top, k, dedup, metaQuota);
     }
 
     /**
      * RRF 融合。向量那一路的 Document 直接复用（已带正文），
      * 关键词那一路新出现的 id 从索引里取正文。
      */
-    private List<Document> fuse(List<Document> vec, List<String> kwIds, int top, int k, boolean dedup) {
+    private List<Document> fuse(List<Document> vec, List<String> kwIds, int top, int k,
+                                boolean dedup, int metaQuota) {
         Map<String, Double> score = new LinkedHashMap<>();
         Map<String, Document> byId = new HashMap<>();
 
@@ -152,7 +173,7 @@ public class HybridRetriever {
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
                 .map(e -> byId.get(e.getKey()))
                 .toList();
-        return dedup ? dedup(ranked, top) : head(ranked, top);
+        return select(ranked, top, dedup ? maxPerDoc : 0, metaQuota);
     }
 
     /**
@@ -162,36 +183,100 @@ public class HybridRetriever {
      * 否则「上下文变少」就成了第二个变量，涨跌说不清是去重带来的还是少喂了带来的。
      */
     private List<Document> dedup(List<Document> ranked, int top) {
-        return dedup(ranked, top, maxPerDoc);
+        return select(ranked, top, maxPerDoc, 0);
     }
 
     /** 静态 + 显式传限额，给单测直接调（不启动 Spring 也能验限额逻辑） */
     static List<Document> dedup(List<Document> ranked, int top, int perDocLimit) {
-        if (perDocLimit <= 0 || ranked.size() <= top) {
-            return head(ranked, top);
+        return select(ranked, top, perDocLimit, 0);
+    }
+
+    /**
+     * 一次挑满 top 条，同时守两个限额：
+     * <ul>
+     *   <li>{@code perDocLimit}：同一份文档最多几块（来源去重）</li>
+     *   <li>{@code metaQuota}：元数据块（【表】/【列取值】）合计最多几块</li>
+     * </ul>
+     *
+     * <p>两轮挑选 + 一轮兜底，<b>保证条数恒等于 min(top, ranked.size())</b>：
+     * <ol>
+     *   <li>第一轮两个限额都守；</li>
+     *   <li>第二轮只放宽文档限额（元数据限额是本次要验的变量，不能松）；</li>
+     *   <li>第三轮连元数据限额也放宽，只为把条数补满 —— 语料里元数据块本来就少
+     *       （7,524 块里只有 75 块），正常不会走到这一步。</li>
+     * </ol>
+     */
+    static List<Document> select(List<Document> ranked, int top, int perDocLimit, int metaQuota) {
+        if (top <= 0 || ranked == null || ranked.isEmpty()) {
+            return new ArrayList<>();
         }
-        List<Document> out = new ArrayList<>(top);
-        List<Document> overflow = new ArrayList<>();
+        List<Document> out = new ArrayList<>(Math.min(top, ranked.size()));
+        boolean[] taken = new boolean[ranked.size()];
         Map<String, Integer> perDoc = new HashMap<>();
-        for (Document d : ranked) {
-            if (out.size() >= top) {
-                break;
+        int metaUsed = 0;
+
+        for (int i = 0; i < ranked.size() && out.size() < top; i++) {
+            Document d = ranked.get(i);
+            boolean meta = isMetaBlock(d.getText());
+            if (perDocLimit > 0 && perDoc.getOrDefault(docKey(d.getId()), 0) >= perDocLimit) {
+                continue;
             }
-            String key = docKey(d.getId());
-            if (perDoc.getOrDefault(key, 0) < perDocLimit) {
-                perDoc.merge(key, 1, Integer::sum);
-                out.add(d);
-            } else {
-                overflow.add(d);
-            }
-        }
-        for (Document d : overflow) {
-            if (out.size() >= top) {
-                break;
+            if (metaQuota > 0 && meta && metaUsed >= metaQuota) {
+                continue;
             }
             out.add(d);
+            taken[i] = true;
+            perDoc.merge(docKey(d.getId()), 1, Integer::sum);
+            if (meta) {
+                metaUsed++;
+            }
+        }
+        for (int i = 0; i < ranked.size() && out.size() < top; i++) {
+            if (taken[i]) {
+                continue;
+            }
+            Document d = ranked.get(i);
+            boolean meta = isMetaBlock(d.getText());
+            if (metaQuota > 0 && meta && metaUsed >= metaQuota) {
+                continue;
+            }
+            out.add(d);
+            taken[i] = true;
+            if (meta) {
+                metaUsed++;
+            }
+        }
+        for (int i = 0; i < ranked.size() && out.size() < top; i++) {
+            if (!taken[i]) {
+                out.add(ranked.get(i));
+            }
         }
         return out;
+    }
+
+    private static final String SOURCE_PREFIX = "【来源：";
+
+    /**
+     * 块首标签是不是元数据块（【表】表级视图 / 【列取值】列取值摘要）。
+     *
+     * <p>注意块正文的真实形态是 {@code 【来源：文件名】 【表】…}，
+     * 所以不能直接 {@code startsWith("【表】")} —— 要先跳过来源前缀。
+     */
+    static boolean isMetaBlock(String text) {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        int i = 0;
+        if (text.startsWith(SOURCE_PREFIX)) {
+            int end = text.indexOf('】');
+            if (end > 0) {
+                i = end + 1;
+            }
+        }
+        while (i < text.length() && Character.isWhitespace(text.charAt(i))) {
+            i++;
+        }
+        return text.startsWith("【表】", i) || text.startsWith("【列取值】", i);
     }
 
     private static List<Document> head(List<Document> list, int top) {
