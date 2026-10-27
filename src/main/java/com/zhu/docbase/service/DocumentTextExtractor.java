@@ -11,6 +11,7 @@ import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTcPr;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STMerge;
 import org.springframework.ai.reader.tika.TikaDocumentReader;
 import org.springframework.core.io.FileSystemResource;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.File;
@@ -63,6 +64,14 @@ import java.util.regex.Pattern;
 @Slf4j
 @Component
 public class DocumentTextExtractor {
+
+    /**
+     * 码值表是否改写成「名称（编码 X）」。默认 true；
+     * 留这个开关是为了**同一次会话里做 A/B**：改完重摄 53 个 docx 就能对比，不用改代码重打包。
+     */
+    @Value("${rag.ingest.code-table-rewrite:false}")
+    private boolean codeTableRewrite = false;
+
 
     /**
      * Tika 解析线程的栈大小：8MB。
@@ -245,6 +254,100 @@ public class DocumentTextExtractor {
     }
 
     /**
+     * 码值说明表改写：把「编码单独一列」变成「编码跟着名称走」。
+     *
+     * <p>要解决的问题（2026-10-27，Y15）：业务文档里的码值表是两列
+     * {@code | 值 | 说明 |} / {@code | 0 | 标准甲 |} / {@code | 1 | 标准乙 |}。
+     * 问「某个字段有哪些取值」时，模型**把"值"列当成了答案**，答「0、1、2、3、4」。
+     * 改写成 {@code 标准甲（编码 0）} 之后，编码不再是独立一列，不会被当成答案。
+     *
+     * <p><b>口径必须窄</b>，只认"两列 + 表头是 值/说明 类 + 左列全是 0~99 的整数"，
+     * 其余表格一律原样输出 —— 这条改的是所有 docx 的表格渲染，宽一点就会波及正常表格。
+     *
+     * @return true = 已按码值表输出；false = 不是码值表，调用方走原来的逐行渲染
+     */
+    private boolean appendCodeTable(StringBuilder sb, List<XWPFTableRow> rows) {
+        // 1) 每行必须正好两格，且没有横/纵向合并（合并会让列语义失真）
+        List<String[]> cells = new ArrayList<>(rows.size());
+        for (XWPFTableRow row : rows) {
+            List<XWPFTableCell> cs = row.getTableCells();
+            if (cs == null || cs.size() != 2) {
+                return false;
+            }
+            String[] pair = new String[2];
+            for (int i = 0; i < 2; i++) {
+                XWPFTableCell cell = cs.get(i);
+                CTTcPr pr = cell.getCTTc() == null ? null : cell.getCTTc().getTcPr();
+                if (pr != null) {
+                    if (pr.isSetGridSpan() && pr.getGridSpan() != null && pr.getGridSpan().getVal() != null
+                            && pr.getGridSpan().getVal().intValue() > 1) {
+                        return false;
+                    }
+                    if (pr.isSetVMerge() && pr.getVMerge() != null
+                            && pr.getVMerge().getVal() == STMerge.CONTINUE) {
+                        return false;
+                    }
+                }
+                String t = cell.getText();
+                pair[i] = t == null ? "" : t.replace('\r', ' ').replace('\n', ' ').strip();
+            }
+            cells.add(pair);
+        }
+        String rendered = renderCodeTable(cells);
+        if (rendered == null) {
+            return false;
+        }
+        sb.append(rendered);
+        return true;
+    }
+
+    /**
+     * 纯函数版：给一组「行 × 两列」的文本，判断是不是码值表并渲染。
+     *
+     * @return null = 不是码值表（调用方走原渲染）；否则是改写后的文本
+     */
+    static String renderCodeTable(List<String[]> cells) {
+        if (cells == null || cells.size() < 3) {   // 表头 + 至少 2 行数据
+            return null;
+        }
+        // 表头：左列是 值/代码/编码，右列是 说明/名称/描述
+        if (!isCodeHeader(cells.get(0)[0]) || !isNameHeader(cells.get(0)[1])) {
+            return null;
+        }
+        // 数据行：左列必须是 0~99 的整数，右列非空
+        for (int i = 1; i < cells.size(); i++) {
+            String[] row = cells.get(i);
+            if (row == null || row.length != 2) {
+                return null;
+            }
+            String code = row[0];
+            if (code == null || code.isEmpty() || code.length() > 2
+                    || !code.chars().allMatch(Character::isDigit)) {
+                return null;
+            }
+            if (row[1] == null || row[1].isEmpty()) {
+                return null;
+            }
+        }
+        StringBuilder out = new StringBuilder("（下表为码值说明，编码已并入名称）\n");
+        for (int i = 1; i < cells.size(); i++) {
+            out.append("- ").append(cells.get(i)[1])
+                    .append("（编码 ").append(cells.get(i)[0]).append("）\n");
+        }
+        return out.toString();
+    }
+
+    private static boolean isCodeHeader(String h) {
+        return "值".equals(h) || "代码".equals(h) || "编码".equals(h)
+                || "code".equalsIgnoreCase(h) || "value".equalsIgnoreCase(h);
+    }
+
+    private static boolean isNameHeader(String h) {
+        return "说明".equals(h) || "名称".equals(h) || "描述".equals(h) || "含义".equals(h)
+                || "name".equalsIgnoreCase(h) || "description".equalsIgnoreCase(h);
+    }
+
+    /**
      * 把一个表格追加成 markdown 行。
      *
      * @param sb    输出缓冲
@@ -253,6 +356,11 @@ public class DocumentTextExtractor {
     private void appendTable(StringBuilder sb, XWPFTable table) {
         List<XWPFTableRow> rows = table.getRows();
         if (rows == null || rows.isEmpty()) {
+            return;
+        }
+        // 【2026-10-27 新增】码值说明表（| 值 | 说明 |）先试一遍窄口径改写，命中就整表按它输出。
+        if (codeTableRewrite && appendCodeTable(sb, rows)) {
+            sb.append('\n');
             return;
         }
         for (XWPFTableRow row : rows) {
